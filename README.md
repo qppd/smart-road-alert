@@ -383,5 +383,3 @@ Raspberry Pi 5 at Opposite Post (Decision Making, Signal Routing)
 This pipeline operates bidirectionally and simultaneously. Each post continuously runs all stages of the pipeline in both the transmission and reception directions, ensuring that the system remains responsive to changes in traffic conditions at either end of the road segment without delay.
 
 ---
-
-*End of Document*
