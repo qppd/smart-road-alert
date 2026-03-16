@@ -46,8 +46,9 @@ logger = logging.getLogger(__name__)
 BAUD_RATE: int            = 115200
 HANDSHAKE_HELLO: str      = "HELLO"
 HANDSHAKE_READY: str      = "ESP32_READY"
-HANDSHAKE_TIMEOUT_S: float = 5.0
-READ_TIMEOUT_S: float      = 1.0
+HANDSHAKE_TIMEOUT_S: float  = 8.0
+HANDSHAKE_RETRY_S: float   = 1.5   # re-send HELLO this often until answered
+READ_TIMEOUT_S: float       = 1.0
 RECONNECT_DELAY_S: float   = 2.0
 MONITOR_POLL_S: float      = 1.0
 
@@ -252,8 +253,11 @@ class SerialManager:
 
         # Allow the ESP32 to complete its USB re-enumeration / reset
         # that is triggered by the host opening the port (DTR toggle).
+        # Use the stop-event so shutdown is not delayed by this sleep.
         logger.debug("Waiting for ESP32 to stabilise after port open...")
-        time.sleep(2.0)
+        if self._stop_event.wait(timeout=2.0):
+            ser.close()
+            return False
         ser.reset_input_buffer()
         ser.reset_output_buffer()
 
@@ -280,12 +284,23 @@ class SerialManager:
         Returns True on success, False on timeout or I/O error.
         """
         logger.info("Handshake: sending %r...", HANDSHAKE_HELLO)
-        deadline = time.monotonic() + HANDSHAKE_TIMEOUT_S
+        deadline   = time.monotonic() + HANDSHAKE_TIMEOUT_S
+        _hello_pkt = (HANDSHAKE_HELLO + "\n").encode("utf-8")
+        last_sent  = 0.0     # force immediate first transmit
 
         try:
-            ser.write((HANDSHAKE_HELLO + "\n").encode("utf-8"))
-
             while time.monotonic() < deadline:
+                if self._stop_event.is_set():
+                    return False
+
+                # (Re)transmit HELLO periodically until the ESP32 replies.
+                now = time.monotonic()
+                if now - last_sent >= HANDSHAKE_RETRY_S:
+                    ser.write(_hello_pkt)
+                    ser.flush()
+                    logger.debug("Handshake: sent %r.", HANDSHAKE_HELLO)
+                    last_sent = now
+
                 if ser.in_waiting > 0:
                     raw  = ser.readline()
                     line = raw.decode("utf-8", errors="replace").strip()
