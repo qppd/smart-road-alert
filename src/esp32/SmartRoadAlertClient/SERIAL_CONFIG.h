@@ -40,6 +40,15 @@
 /** Milliseconds between automatic heartbeat JSON packets. */
 #define HEARTBEAT_INTERVAL_MS     2000UL
 
+/**
+ * Milliseconds without any message from the host before resetting to
+ * SERIAL_WAITING_HANDSHAKE.  Allows the ESP32 to recover cleanly if the
+ * Raspberry Pi reconnects without hardware-resetting the ESP32.
+ * Must be safely larger than the RPi's PING_INTERVAL_S (5 s × 1000).
+ * Set to 0UL to disable the timeout.
+ */
+#define HOST_SILENCE_TIMEOUT_MS   15000UL
+
 /** Character that terminates every message frame. */
 #define MSG_TERMINATOR            '\n'
 

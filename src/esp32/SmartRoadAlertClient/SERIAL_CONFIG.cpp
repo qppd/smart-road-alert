@@ -38,6 +38,9 @@ static unsigned long s_last_heartbeat_ms = 0;
 /** millis() timestamp when the current handshake wait began. */
 static unsigned long s_handshake_ts_ms   = 0;
 
+/** millis() timestamp of the last message received from the host. */
+static unsigned long s_last_host_rx_ms   = 0;
+
 // ─── Private Helper Declarations ─────────────────────────────────────────────
 
 static void _dispatch_line(const char *line);
@@ -59,6 +62,7 @@ void serial_init(void) {
     s_state             = SERIAL_WAITING_HANDSHAKE;
     s_handshake_ts_ms   = millis();
     s_last_heartbeat_ms = millis();
+    s_last_host_rx_ms   = millis();
 
     Serial.println(F("[SERIAL] Initialised — awaiting HELLO from host."));
 }
@@ -147,6 +151,9 @@ static void _dispatch_line(const char *line) {
         /* Any other data during handshake is ignored. */
 
     } else if (s_state == SERIAL_CONNECTED) {
+        /* Track host activity for silence detection. */
+        s_last_host_rx_ms = millis();
+
         /*
          * Check whether the host has re-initiated handshake (e.g. after
          * reconnect on its side).  If so, re-run the handshake rather
@@ -175,6 +182,7 @@ static void _on_handshake_hello(void) {
     Serial.println(HANDSHAKE_READY);   /* Send ESP32_READY to host. */
     s_state             = SERIAL_CONNECTED;
     s_last_heartbeat_ms = millis();
+    s_last_host_rx_ms   = millis();   /* reset silence timer on new connection */
     Serial.println(F("[SERIAL] Handshake complete — connected."));
 }
 
@@ -208,4 +216,16 @@ static void _tick_connected(void) {
         /* Heartbeat is a valid JSON object — host can parse or ignore it. */
         Serial.println(F("{\"type\":\"heartbeat\"}"));
     }
+
+    /* Host-silence detection: if the RPi stops sending (disconnect, crash,
+     * etc.) reset to WAITING_HANDSHAKE so the next HELLO re-establishes the
+     * link without needing a full ESP32 hardware reset. */
+#if HOST_SILENCE_TIMEOUT_MS > 0
+    if (now - s_last_host_rx_ms >= HOST_SILENCE_TIMEOUT_MS) {
+        s_state           = SERIAL_WAITING_HANDSHAKE;
+        s_handshake_ts_ms = now;
+        s_rx_idx          = 0;
+        Serial.println(F("[SERIAL] Host silent — reset to WAITING_HANDSHAKE."));
+    }
+#endif
 }
