@@ -11,6 +11,13 @@ static SerialConnectionState s_state     = SERIAL_DISCONNECTED;
 static unsigned long s_last_heartbeat_ms = 0;
 static unsigned long s_handshake_ts_ms   = 0;
 
+<<<<<<< HEAD
+=======
+/** millis() timestamp of the last message received from the host. */
+static unsigned long s_last_host_rx_ms   = 0;
+
+// ─── Private Helper Declarations ─────────────────────────────────────────────
+>>>>>>> c5775b7481ebb48771f864734341264ebef689df
 
 static void _dispatch_line(const char *line);
 static void _on_handshake_hello(void);
@@ -28,6 +35,7 @@ void serial_init(void) {
     s_state             = SERIAL_WAITING_HANDSHAKE;
     s_handshake_ts_ms   = millis();
     s_last_heartbeat_ms = millis();
+    s_last_host_rx_ms   = millis();
 
     Serial.println(F("[SERIAL] Initialised — awaiting HELLO from host."));
 }
@@ -103,7 +111,18 @@ static void _dispatch_line(const char *line) {
        
 
     } else if (s_state == SERIAL_CONNECTED) {
+<<<<<<< HEAD
        
+=======
+        /* Track host activity for silence detection. */
+        s_last_host_rx_ms = millis();
+
+        /*
+         * Check whether the host has re-initiated handshake (e.g. after
+         * reconnect on its side).  If so, re-run the handshake rather
+         * than treating HELLO as a JSON message.
+         */
+>>>>>>> c5775b7481ebb48771f864734341264ebef689df
         if (strcmp(line, HANDSHAKE_HELLO) == 0) {
             Serial.println(F("[SERIAL] Re-handshake requested by host."));
             _on_handshake_hello();
@@ -121,6 +140,7 @@ static void _on_handshake_hello(void) {
     Serial.println(HANDSHAKE_READY);   
     s_state             = SERIAL_CONNECTED;
     s_last_heartbeat_ms = millis();
+    s_last_host_rx_ms   = millis();   /* reset silence timer on new connection */
     Serial.println(F("[SERIAL] Handshake complete — connected."));
 }
 
@@ -140,4 +160,16 @@ static void _tick_connected(void) {
        
         Serial.println(F("{\"type\":\"heartbeat\"}"));
     }
+
+    /* Host-silence detection: if the RPi stops sending (disconnect, crash,
+     * etc.) reset to WAITING_HANDSHAKE so the next HELLO re-establishes the
+     * link without needing a full ESP32 hardware reset. */
+#if HOST_SILENCE_TIMEOUT_MS > 0
+    if (now - s_last_host_rx_ms >= HOST_SILENCE_TIMEOUT_MS) {
+        s_state           = SERIAL_WAITING_HANDSHAKE;
+        s_handshake_ts_ms = now;
+        s_rx_idx          = 0;
+        Serial.println(F("[SERIAL] Host silent — reset to WAITING_HANDSHAKE."));
+    }
+#endif
 }

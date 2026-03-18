@@ -43,14 +43,17 @@ logger = logging.getLogger(__name__)
 
 # ─── Protocol Constants ───────────────────────────────────────────────────────
 
-BAUD_RATE: int            = 115200
-HANDSHAKE_HELLO: str      = "HELLO"
-HANDSHAKE_READY: str      = "ESP32_READY"
-HANDSHAKE_TIMEOUT_S: float  = 8.0
-HANDSHAKE_RETRY_S: float   = 1.5   # re-send HELLO this often until answered
-READ_TIMEOUT_S: float       = 1.0
+BAUD_RATE: int             = 115200
+HANDSHAKE_HELLO: str       = "HELLO"
+HANDSHAKE_READY: str       = "ESP32_READY"
+HANDSHAKE_TIMEOUT_S: float = 8.0
+HANDSHAKE_RETRY_S: float   = 1.5    # re-send HELLO this often until answered
+READ_TIMEOUT_S: float      = 1.0
 RECONNECT_DELAY_S: float   = 2.0
 MONITOR_POLL_S: float      = 1.0
+# If no bytes arrive for this long the link is presumed dead even without an
+# I/O error.  Must be > ESP32 HEARTBEAT_INTERVAL_MS (2 s) with headroom.
+SILENCE_TIMEOUT_S: float   = 6.0
 
 # Serial port name prefixes tried in order during discovery.
 PORT_PREFIXES: Tuple[str, ...] = ("/dev/ttyUSB", "/dev/ttyACM")
@@ -246,14 +249,21 @@ class SerialManager:
                 port=port,
                 baudrate=BAUD_RATE,
                 timeout=READ_TIMEOUT_S,
+                write_timeout=2.0,
+                exclusive=True,       # TIOCEXCL: block concurrent opens (ModemManager, brltty)
             )
+            # Deassert DTR/RTS immediately after open.  The standard ESP32
+            # auto-reset circuit needs DTR asserted for ~10 ms+ to fire;
+            # clearing within ~1 ms of open() prevents spurious reboots.
+            ser.dtr = False
+            ser.rts = False
         except serial.SerialException as exc:
             logger.error("Failed to open %s: %s", port, exc)
             return False
 
-        # Allow the ESP32 to complete its USB re-enumeration / reset
-        # that is triggered by the host opening the port (DTR toggle).
-        # Use the stop-event so shutdown is not delayed by this sleep.
+        # Give the ESP32 time to finish booting if it did auto-reset, or
+        # to finish transmitting any in-flight heartbeat if it did not.
+        # interruptible so shutdown is not delayed.
         logger.debug("Waiting for ESP32 to stabilise after port open...")
         if self._stop_event.wait(timeout=2.0):
             ser.close()
@@ -342,6 +352,8 @@ class SerialManager:
         Runs on the SerialReader thread — do not call directly.
         """
         logger.info("Reader thread started.")
+        last_rx      = time.monotonic()
+        was_connected = False
 
         while not self._stop_event.is_set():
             with self._lock:
@@ -349,6 +361,26 @@ class SerialManager:
                 connected = self._connected
 
             if not connected or ser is None:
+                was_connected = False
+                time.sleep(0.1)
+                continue
+
+            # Reset silence timer on each fresh connection so stale time
+            # from the disconnected period does not trigger an immediate drop.
+            if not was_connected:
+                last_rx = time.monotonic()
+            was_connected = True
+
+            # ── Silence-timeout: detect dead link without an I/O error ──
+            # The ESP32 sends a heartbeat every 2 s.  Six seconds without
+            # any byte means the link is silently gone.
+            if time.monotonic() - last_rx > SILENCE_TIMEOUT_S:
+                logger.warning(
+                    "Reader: no data received for %.0f s — link presumed dead.",
+                    SILENCE_TIMEOUT_S,
+                )
+                with self._lock:
+                    self._connected = False
                 time.sleep(0.1)
                 continue
 
@@ -364,6 +396,8 @@ class SerialManager:
 
             if not raw:
                 continue
+
+            last_rx = time.monotonic()
 
             line = raw.decode("utf-8", errors="replace").strip()
             if not line:

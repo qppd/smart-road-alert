@@ -6,17 +6,24 @@ Smart Road Alert — Raspberry Pi Host Controller
 Entry point for the Smart Road Alert host application.
 
 Responsibilities:
-    - Initialise and start the SerialManager.
-    - Main thread: process inbound ESP32 messages and send periodic commands.
+    - Initialise and start the SerialManager (ESP32 ↔ RPi USB link).
+    - Initialise and start the HC12Manager (RPi 1 ↔ RPi 2 peer-to-peer wireless).
+    - Main thread: process inbound ESP32 and HC-12 messages, forward telemetry,
+      and send periodic commands.
     - Graceful shutdown on SIGINT / SIGTERM.
 
-Architecture:
-    main.py  ──uses──►  serial_config.SerialManager
-                            │
-                            ├── Thread: SerialReader  (reads lines → queue)
-                            └── Thread: ConnectionMonitor (reconnects on loss)
+Architecture (Fully Symmetric Peer-to-Peer):
+    Both RPis run identical code with identical hardware. Each RPi:
+    ✓ Has a local ESP32 (USB).
+    ✓ Has an HC-12 radio module (UART /dev/ttyS0).
+    ✓ Communicates bidirectionally with the peer RPi via HC-12.
+    ✓ Processes and forwards telemetry from both local and remote sources.
 
-All serial communication is accessed exclusively through SerialManager's API.
+    RPi 1              HC-12 433 MHz              RPi 2
+    ├─ ESP32 [USB]  ────────────────────────  ESP32 [USB]
+    └─ HC-12 Radio  ════════════════════════  HC-12 Radio
+
+All serial communication is accessed exclusively through each manager's API.
 This file does NOT import the 'serial' package directly.
 """
 
@@ -29,6 +36,7 @@ import sys
 import time
 from typing import Optional
 
+from hc12_config import HC12Manager
 from serial_config import SerialManager
 
 # ─── Logging Configuration ────────────────────────────────────────────────────
@@ -41,6 +49,10 @@ logging.basicConfig(
 logger = logging.getLogger("SmartRoadAlert")
 
 # ─── Application Timing Constants ─────────────────────────────────────────────
+
+# Whether to attempt connection to a local ESP32 device via USB.
+# Both RPis have their own ESP32 attached, so this should be True on both.
+ESP32_ENABLED: bool = True
 
 # How often to send a PING command to the ESP32 (seconds).
 PING_INTERVAL_S: float   = 5.0
@@ -60,12 +72,15 @@ class SmartRoadAlertHost:
     """
     Main application controller for the Smart Road Alert Raspberry Pi host.
 
-    Interacts with the ESP32 exclusively through SerialManager.
-    Processes inbound telemetry and dispatches outbound commands.
+    Each RPi independently:
+    1. Reads telemetry from its local ESP32 via USB (SerialManager).
+    2. Sends/receives telemetry to/from the peer RPi via HC-12 radio (HC12Manager).
+    3. Processes alerts and forwards data bidirectionally.
     """
 
     def __init__(self) -> None:
-        self._serial          = SerialManager()
+        self._serial: Optional[SerialManager] = SerialManager() if ESP32_ENABLED else None
+        self._hc12            = HC12Manager()
         self._running: bool   = False
         self._t_last_ping     = 0.0
         self._t_last_status   = 0.0
@@ -73,17 +88,21 @@ class SmartRoadAlertHost:
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Initialise serial connection and enter the main processing loop."""
+        """Initialise serial connections and enter the main processing loop."""
         logger.info("Smart Road Alert Host starting.")
-        self._serial.start()
+        if self._serial is not None:
+            self._serial.start()
+        self._hc12.start()
         self._running = True
         self._run_loop()
 
     def stop(self) -> None:
-        """Graceful shutdown — drain queue, stop threads, close port."""
+        """Graceful shutdown — drain queues, stop threads, close ports."""
         logger.info("Smart Road Alert Host shutting down...")
         self._running = False
-        self._serial.stop()
+        if self._serial is not None:
+            self._serial.stop()
+        self._hc12.stop()
         logger.info("Shutdown complete.")
 
     # ─── Main Loop ────────────────────────────────────────────────────────────
@@ -101,15 +120,23 @@ class SmartRoadAlertHost:
         while self._running:
             now = time.monotonic()
 
-            # ── Process all queued inbound messages ──
-            while True:
-                msg = self._serial.receive()
-                if msg is None:
-                    break
-                self._handle_message(msg)
+            # ── Process all queued inbound messages from the local ESP32 (if enabled) ──
+            if self._serial is not None:
+                while True:
+                    msg = self._serial.receive()
+                    if msg is None:
+                        break
+                    self._handle_esp32_message(msg)
 
-            # ── Periodic commands (only while connected) ──
-            if self._serial.is_connected():
+            # ── Process all queued inbound messages from the HC-12 radio link ──
+            while True:
+                wireless_msg = self._hc12.receive()
+                if wireless_msg is None:
+                    break
+                self._handle_wireless_message(wireless_msg)
+
+            # ── Periodic commands to ESP32 (only while connected) ──
+            if self._serial is not None and self._serial.is_connected():
 
                 if now - self._t_last_ping >= PING_INTERVAL_S:
                     self._t_last_ping = now
@@ -125,21 +152,22 @@ class SmartRoadAlertHost:
 
     # ─── Message Dispatcher ───────────────────────────────────────────────────
 
-    def _handle_message(self, raw: str) -> None:
+    def _handle_esp32_message(self, raw: str) -> None:
         """
-        Parse a JSON line received from the ESP32 and dispatch to the
+        Parse a JSON line received from the local ESP32 and dispatch to the
         appropriate handler.
         """
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            logger.warning("Received non-JSON message: %r", raw)
+            logger.warning("ESP32: received non-JSON message: %r", raw)
             return
 
         msg_type: str = data.get("type", "")
 
         if msg_type == "vehicle":
-            self._on_vehicle_data(data)
+            # Local telemetry from ESP32 — process and forward to remote RPi.
+            self._on_local_vehicle_data(data)
 
         elif msg_type == "pong":
             logger.info("ESP32 PONG received.")
@@ -155,45 +183,126 @@ class SmartRoadAlertHost:
             logger.warning("ESP32 error: %s", data.get("msg", "(no detail)"))
 
         else:
-            logger.warning("Unknown message type %r: %s", msg_type, raw)
+            logger.warning("ESP32: unknown message type %r: %s", msg_type, raw)
 
     # ─── Message Handlers ─────────────────────────────────────────────────────
 
-    def _on_vehicle_data(self, data: dict) -> None:
+    def _on_local_vehicle_data(self, data: dict) -> None:
         """
-        Process a vehicle telemetry packet.
-
-        Expected fields:
-            speed    (float)  — vehicle speed, km/h
-            distance (float)  — forward distance, metres
-
-        Extend this method to persist data, trigger alerts, forward to cloud, etc.
+        Process telemetry from the local ESP32 device.
+        
+        1. Validate and log the data.
+        2. Trigger local alerts.
+        3. Forward over HC-12 to the remote RPi.
         """
         speed: Optional[float]    = data.get("speed")
         distance: Optional[float] = data.get("distance")
 
         if speed is None or distance is None:
-            logger.warning("Incomplete vehicle packet: %s", data)
+            logger.warning("Incomplete vehicle packet from ESP32: %s", data)
             return
 
         speed    = float(speed)
         distance = float(distance)
 
         logger.info(
-            "Vehicle telemetry — speed: %.1f km/h, distance: %.1f m",
+            "Local vehicle telemetry (ESP32) — speed: %.1f km/h, distance: %.1f m",
             speed, distance,
         )
 
+        # ── Apply alert thresholds locally ──
+        self._process_vehicle_telemetry(speed, distance, source="local_esp32")
+
+        # ── Forward to the remote RPi via HC-12 ──
+        if self._hc12.is_connected():
+            wireless_payload = json.dumps(
+                {"type": "vehicle", "speed": speed, "distance": distance, "source": "esp32"}
+            )
+            self._hc12.send(wireless_payload)
+            logger.debug("Forwarded to remote RPi via HC-12: %s", wireless_payload)
+
+    def _on_remote_vehicle_data(self, data: dict) -> None:
+        """
+        Process telemetry received from the remote RPi over the HC-12 radio link.
+        
+        1. Validate and log the data.
+        2. Trigger local alerts (e.g., alert siren on this node).
+        """
+        speed: Optional[float]    = data.get("speed")
+        distance: Optional[float] = data.get("distance")
+
+        if speed is None or distance is None:
+            logger.warning("Incomplete vehicle packet from HC-12: %s", data)
+            return
+
+        speed    = float(speed)
+        distance = float(distance)
+
+        logger.info(
+            "Remote vehicle telemetry (HC-12) — speed: %.1f km/h, distance: %.1f m",
+            speed, distance,
+        )
+
+        # ── Apply alert thresholds locally ──
+        self._process_vehicle_telemetry(speed, distance, source="remote_rpi")
+
+    def _process_vehicle_telemetry(self, speed: float, distance: float, source: str) -> None:
+        """
+        Common alert logic for vehicle telemetry from any source.
+        
+        Parameters
+        ----------
+        speed   : float — vehicle speed in km/h
+        distance : float — forward distance in metres
+        source   : str   — where the data came from ("local_esp32" or "remote_rpi")
+        """
         # ── Alert thresholds ──
         if speed > 80.0:
             logger.warning(
-                "ALERT: High-speed vehicle detected (%.1f km/h).", speed
+                "ALERT: High-speed vehicle detected (%.1f km/h) [source: %s].",
+                speed, source,
             )
+            # TODO: Trigger siren, display, notification, etc.
 
         if distance < 5.0:
             logger.warning(
-                "ALERT: Vehicle proximity warning (%.1f m).", distance
+                "ALERT: Vehicle proximity warning (%.1f m) [source: %s].",
+                distance, source,
             )
+            # TODO: Trigger siren, display, notification, etc.
+
+
+    # ─── HC-12 Wireless Message Handler ─────────────────────────────────────
+
+    def _handle_wireless_message(self, raw: str) -> None:
+        """
+        Parse and dispatch a JSON message received over the HC-12 radio link
+        from the remote Raspberry Pi (true peer-to-peer communication).
+        """
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("HC-12: received non-JSON message: %r", raw)
+            return
+
+        msg_type: str = data.get("type", "")
+
+        if msg_type == "vehicle":
+            # Remote RPi sent telemetry — process and trigger local alerts.
+            self._on_remote_vehicle_data(data)
+
+        elif msg_type == "ack":
+            logger.info("HC-12 ACK from remote RPi: %s", data.get("msg", ""))
+
+        elif msg_type == "alert":
+            logger.warning("HC-12 ALERT from remote RPi: %s", data.get("msg", "(no detail)"))
+
+        elif msg_type == "status":
+            status = data.get("status", "(no detail)")
+            logger.info("HC-12 status from remote RPi: %s", status)
+
+        else:
+            logger.warning("HC-12: unknown message type %r: %s", msg_type, raw)
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
