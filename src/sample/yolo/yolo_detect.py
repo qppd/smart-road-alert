@@ -8,6 +8,11 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+try:
+    import depthai as dai
+except ImportError:
+    dai = None
+
 # Define and parse user input arguments
 
 parser = argparse.ArgumentParser()
@@ -64,6 +69,8 @@ elif 'usb' in img_source:
 elif 'picamera' in img_source:
     source_type = 'picamera'
     picam_idx = int(img_source[8:])
+elif 'oak' in img_source:
+    source_type = 'oak'
 else:
     print(f'Input {img_source} is invalid. Please try again.')
     sys.exit(0)
@@ -115,6 +122,26 @@ elif source_type == 'picamera':
     cap.configure(cap.create_video_configuration(main={"format": 'XRGB8888', "size": (resW, resH)}))
     cap.start()
 
+elif source_type == 'oak':
+    if dai is None:
+        print('ERROR: depthai package is not installed. Install it with: pip install depthai')
+        sys.exit(1)
+    try:
+        # Build DepthAI pipeline with RGB ColorCamera → XLinkOut
+        oak_pipeline = dai.Pipeline()
+        cam_rgb = oak_pipeline.create(dai.node.ColorCamera)
+        xout_rgb = oak_pipeline.create(dai.node.XLinkOut)
+        xout_rgb.setStreamName('rgb')
+        cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+        cam_rgb.setInterleaved(False)
+        cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+        cam_rgb.video.link(xout_rgb.input)
+        oak_device = dai.Device(oak_pipeline)
+        oak_queue = oak_device.getOutputQueue(name='rgb', maxSize=4, blocking=False)
+    except Exception as e:
+        print(f'ERROR: Failed to initialize OAK/MyriadX device: {e}')
+        sys.exit(1)
+
 # Set bounding box colors (using the Tableu 10 color scheme)
 bbox_colors = [(164,120,87), (68,148,228), (93,97,209), (178,182,133), (88,159,106), 
               (96,202,231), (159,124,168), (169,162,241), (98,118,150), (172,176,184)]
@@ -156,6 +183,15 @@ while True:
         frame = cv2.cvtColor(np.copy(frame_bgra), cv2.COLOR_BGRA2BGR)
         if (frame is None):
             print('Unable to read frames from the Picamera. This indicates the camera is disconnected or not working. Exiting program.')
+            break
+
+    elif source_type == 'oak': # If source is OAK-D / MyriadX, grab frame from DepthAI queue (non-blocking)
+        in_rgb = oak_queue.tryGet()
+        if in_rgb is None:
+            continue
+        frame = in_rgb.getCvFrame()  # Already BGR numpy array
+        if frame is None:
+            print('Unable to read frames from the OAK/MyriadX device. Exiting program.')
             break
 
     # Resize frame to desired display resolution
@@ -202,8 +238,8 @@ while True:
             # Basic example: count the number of objects in the image
             object_count = object_count + 1
 
-    # Calculate and draw framerate (if using video, USB, or Picamera source)
-    if source_type == 'video' or source_type == 'usb' or source_type == 'picamera':
+    # Calculate and draw framerate (if using video, USB, Picamera, or OAK source)
+    if source_type == 'video' or source_type == 'usb' or source_type == 'picamera' or source_type == 'oak':
         cv2.putText(frame, f'FPS: {avg_frame_rate:0.2f}', (10,20), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,255,255), 2) # Draw framerate
     
     # Display detection results
@@ -214,7 +250,7 @@ while True:
     # If inferencing on individual images, wait for user keypress before moving to next image. Otherwise, wait 5ms before moving to next frame.
     if source_type == 'image' or source_type == 'folder':
         key = cv2.waitKey()
-    elif source_type == 'video' or source_type == 'usb' or source_type == 'picamera':
+    elif source_type == 'video' or source_type == 'usb' or source_type == 'picamera' or source_type == 'oak':
         key = cv2.waitKey(5)
     
     if key == ord('q') or key == ord('Q'): # Press 'q' to quit
@@ -245,6 +281,8 @@ if source_type == 'video' or source_type == 'usb':
     cap.release()
 elif source_type == 'picamera':
     cap.stop()
+elif source_type == 'oak':
+    oak_device.close()
 if record: recorder.release()
 cv2.destroyAllWindows()
 
