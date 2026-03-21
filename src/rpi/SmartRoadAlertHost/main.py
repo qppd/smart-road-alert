@@ -29,10 +29,12 @@ This file does NOT import the 'serial' package directly.
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import signal
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -48,11 +50,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SmartRoadAlert")
 
+# ─── Optional Camera Inference Imports ────────────────────────────────────────
+
+try:
+    import cv2
+    from ultralytics import YOLO as _YOLO
+    _CAMERA_INFERENCE_AVAILABLE = True
+except ImportError:
+    cv2 = None        # type: ignore[assignment]
+    _YOLO = None      # type: ignore[assignment]
+    _CAMERA_INFERENCE_AVAILABLE = False
+
 # ─── Application Timing Constants ─────────────────────────────────────────────
 
 # Whether to attempt connection to a local ESP32 device via USB.
 # Both RPis have their own ESP32 attached, so this should be True on both.
 ESP32_ENABLED: bool = True
+
+# Whether to start YOLOv8n camera inference (requires ultralytics + opencv).
+CAMERA_INFERENCE_ENABLED: bool = True
 
 # How often to send a PING command to the ESP32 (seconds).
 PING_INTERVAL_S: float   = 5.0
@@ -84,6 +100,8 @@ class SmartRoadAlertHost:
         self._running: bool   = False
         self._t_last_ping     = 0.0
         self._t_last_status   = 0.0
+        self._camera_thread: Optional[threading.Thread] = None
+        self._camera_running: bool = False
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -94,16 +112,124 @@ class SmartRoadAlertHost:
             self._serial.start()
         self._hc12.start()
         self._running = True
+        self.start_camera_inference()
         self._run_loop()
 
     def stop(self) -> None:
         """Graceful shutdown — drain queues, stop threads, close ports."""
         logger.info("Smart Road Alert Host shutting down...")
         self._running = False
+        self._camera_running = False
+        if self._camera_thread is not None:
+            self._camera_thread.join(timeout=2)
         if self._serial is not None:
             self._serial.stop()
         self._hc12.stop()
         logger.info("Shutdown complete.")
+
+    # ─── Camera Inference ─────────────────────────────────────────────────────
+
+    def start_camera_inference(self) -> None:
+        """Start YOLOv8n camera inference in a non-blocking daemon thread.
+
+        Does nothing if ``CAMERA_INFERENCE_ENABLED`` is ``False`` or if
+        the required packages (``ultralytics``, ``opencv-python-headless``)
+        are not installed.
+        """
+        if not CAMERA_INFERENCE_ENABLED:
+            logger.info("Camera inference disabled by configuration.")
+            return
+        if not _CAMERA_INFERENCE_AVAILABLE:
+            logger.warning(
+                "Camera inference unavailable: install 'ultralytics' and "
+                "'opencv-python-headless' to enable."
+            )
+            return
+
+        def camera_loop() -> None:
+            # ── 1. Auto-detect first available USB camera ──────────────────
+            cams = glob.glob("/dev/video*")
+            cam_path = cams[0] if cams else "/dev/video0"
+            cap = cv2.VideoCapture(cam_path)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(0)  # index-based fallback
+            if not cap.isOpened():
+                logger.error(
+                    "Camera inference: could not open any camera — thread exiting."
+                )
+                return
+            logger.info("Camera inference: opened camera at %s.", cam_path)
+
+            # ── 2. Load YOLOv8n model ──────────────────────────────────────
+            try:
+                model = _YOLO("yolov8n.pt")
+                logger.info("Camera inference: YOLOv8n model loaded.")
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Camera inference: failed to load YOLOv8n model: %s", exc)
+                cap.release()
+                return
+
+            # ── 3. Inference loop ──────────────────────────────────────────
+            while self._camera_running:
+                ret, frame = cap.read()
+                if not ret:
+                    logger.warning(
+                        "Camera inference: failed to read frame — retrying."
+                    )
+                    time.sleep(0.5)
+                    continue
+
+                # ── 4. Run inference ───────────────────────────────────────
+                try:
+                    results = model(frame, verbose=False)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Camera inference: inference error: %s", exc)
+                    time.sleep(0.1)
+                    continue
+
+                # ── 5. Log detections and invoke optional hook ─────────────
+                detections: list[dict] = []
+                for result in results:
+                    for box in result.boxes:
+                        cls_id = int(box.cls[0])
+                        conf   = float(box.conf[0])
+                        label  = model.names.get(cls_id, str(cls_id))
+                        detections.append({"label": label, "confidence": conf})
+                        logger.info(
+                            "Camera detection: %s (confidence: %.2f)", label, conf
+                        )
+
+                if detections:
+                    self._on_inference_detections(detections)
+
+                # ── Minimal sleep to prevent CPU saturation ────────────────
+                time.sleep(0.03)
+
+            cap.release()
+            logger.info("Camera inference thread stopped.")
+
+        self._camera_running = True
+        self._camera_thread = threading.Thread(
+            target=camera_loop, name="camera-inference", daemon=True
+        )
+        self._camera_thread.start()
+        logger.info("Camera inference thread started.")
+
+    def _on_inference_detections(self, detections: list) -> None:
+        """Hook called with each frame's detection results.
+
+        Override or extend this method to route inference output into
+        additional processing pipelines (e.g. ``_process_vehicle_telemetry``)
+        without modifying any existing function signatures.
+
+        Parameters
+        ----------
+        detections:
+            List of dicts with keys ``"label"`` (str) and ``"confidence"``
+            (float) for every bounding box detected in the current frame.
+        """
+        # Default: detections are already logged inside camera_loop; no-op here.
+        pass
 
     # ─── Main Loop ────────────────────────────────────────────────────────────
 

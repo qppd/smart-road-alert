@@ -1,3 +1,5 @@
 pyserial>=3.5
-RPi.GPIO>=0.7.0   # HC-12 SET pin control (GPIO17); install only on Raspberry Pi hardware
+RPi.GPIO>=0.7.0           # HC-12 SET pin control (GPIO17); install only on Raspberry Pi hardware
+ultralytics>=8.0.0        # YOLOv8n model inference
+opencv-python-headless>=4.8.0  # Camera capture (headless, no GUI dependencies)
 
