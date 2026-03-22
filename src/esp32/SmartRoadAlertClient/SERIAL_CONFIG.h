@@ -7,10 +7,7 @@
 #define SERIAL_RX_BUFFER_SIZE     512
 #define SERIAL_TX_BUFFER_SIZE     256
 #define HANDSHAKE_TIMEOUT_MS      5000UL
-
 #define HEARTBEAT_INTERVAL_MS     2000UL
-<<<<<<< HEAD
-=======
 
 /**
  * Milliseconds without any message from the host before resetting to
@@ -21,8 +18,6 @@
  */
 #define HOST_SILENCE_TIMEOUT_MS   15000UL
 
-/** Character that terminates every message frame. */
->>>>>>> c5775b7481ebb48771f864734341264ebef689df
 #define MSG_TERMINATOR            '\n'
 
 

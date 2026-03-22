@@ -11,13 +11,10 @@ static SerialConnectionState s_state     = SERIAL_DISCONNECTED;
 static unsigned long s_last_heartbeat_ms = 0;
 static unsigned long s_handshake_ts_ms   = 0;
 
-<<<<<<< HEAD
-=======
 /** millis() timestamp of the last message received from the host. */
 static unsigned long s_last_host_rx_ms   = 0;
 
 // ─── Private Helper Declarations ─────────────────────────────────────────────
->>>>>>> c5775b7481ebb48771f864734341264ebef689df
 
 static void _dispatch_line(const char *line);
 static void _on_handshake_hello(void);
@@ -111,9 +108,6 @@ static void _dispatch_line(const char *line) {
        
 
     } else if (s_state == SERIAL_CONNECTED) {
-<<<<<<< HEAD
-       
-=======
         /* Track host activity for silence detection. */
         s_last_host_rx_ms = millis();
 
@@ -122,7 +116,7 @@ static void _dispatch_line(const char *line) {
          * reconnect on its side).  If so, re-run the handshake rather
          * than treating HELLO as a JSON message.
          */
->>>>>>> c5775b7481ebb48771f864734341264ebef689df
+
         if (strcmp(line, HANDSHAKE_HELLO) == 0) {
             Serial.println(F("[SERIAL] Re-handshake requested by host."));
             _on_handshake_hello();

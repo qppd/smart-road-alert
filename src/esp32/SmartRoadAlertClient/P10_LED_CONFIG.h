@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <Adafruit_GFX.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+#include "PINS_CONFIG.h"
 
 // =======================================================================
 // P10 Full-Color Panel  |  32x16 px, 1/4-scan, HUB75, SMD3535
@@ -31,19 +32,20 @@
 #define P10_LOGICAL_W   48   // Logical width  (PANEL_CHAIN * 16, rotated)
 #define P10_LOGICAL_H   32   // Logical height (32 rows after 90-deg rotation)
 
-// HUB75 Pin Definitions (full-color: separate R/G/B lines)
-#define P_R1  4
-#define P_G1  5
-#define P_B1  15
-#define P_R2  25
-#define P_G2  18
-#define P_B2  26
-#define P_A   27
-#define P_B   19
-#define P_C   14
-#define P_LAT 23
-#define P_OE  13
-#define P_CLK 21
+// HUB75 Pin Definitions — numeric values are centralised in PINS_CONFIG.h.
+// These aliases preserve backward compatibility with P10_LED_CONFIG.cpp.
+#define P_R1  PIN_P10_R1
+#define P_G1  PIN_P10_G1
+#define P_B1  PIN_P10_B1
+#define P_R2  PIN_P10_R2
+#define P_G2  PIN_P10_G2
+#define P_B2  PIN_P10_B2
+#define P_A   PIN_P10_A
+#define P_B   PIN_P10_B
+#define P_C   PIN_P10_C
+#define P_LAT PIN_P10_LAT
+#define P_OE  PIN_P10_OE
+#define P_CLK PIN_P10_CLK
 
 // Custom Adafruit_GFX subclass that remaps logical coordinates to the
 // physical DMA buffer via S-shape rotation + 1/4-scan addressing.
