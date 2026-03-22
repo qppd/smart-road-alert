@@ -1,0 +1,5 @@
+# Ignore Python virtual environments
+src/rpi/SmartRoadAlertHost/venv/
+src/rpi/SmartRoadAlertHost/__pycache__/
+src/sample/yolo/venv/
+src/sample/yolo/__pycache__/
