@@ -1,10 +1,11 @@
 import depthai as dai
+import cv2
 
 # Create pipeline
 pipeline = dai.Pipeline()
 
 # Define camera
-cam = pipeline.createColorCamera()
+cam = pipeline.createRGBCamera()
 cam.setPreviewSize(640, 480)
 cam.setInterleaved(False)
 
