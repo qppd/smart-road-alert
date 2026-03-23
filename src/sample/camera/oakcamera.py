@@ -4,8 +4,9 @@ import cv2
 # Create pipeline
 pipeline = dai.Pipeline()
 
+
 # Define camera
-cam = pipeline.createRGBCamera()
+cam = pipeline.create(dai.node.ColorCamera)
 cam.setPreviewSize(640, 480)
 cam.setInterleaved(False)
 
