@@ -327,10 +327,12 @@ class SmartRoadAlertHost:
                     frame = self._latest_frame
                 if frame is not None:
                     cv2.imshow("Smart Road Alert — YOLO", frame)
-                    if cv2.waitKey(1) == ord('q'):
-                        self._camera_running = False
-
-            time.sleep(POLL_INTERVAL_S)
+                key = cv2.waitKey(30)
+                if key == ord('q'):
+                    self._camera_running = False
+                    self._running = False
+            else:
+                time.sleep(POLL_INTERVAL_S)
 
     # ─── Message Dispatcher ───────────────────────────────────────────────────
 
