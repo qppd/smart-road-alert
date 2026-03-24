@@ -55,10 +55,12 @@ logger = logging.getLogger("SmartRoadAlert")
 
 try:
     import cv2
+    import depthai as dai
     from ultralytics import YOLO as _YOLO
     _CAMERA_INFERENCE_AVAILABLE = True
 except ImportError:
     cv2 = None        # type: ignore[assignment]
+    dai = None        # type: ignore[assignment]
     _YOLO = None      # type: ignore[assignment]
     _CAMERA_INFERENCE_AVAILABLE = False
 
@@ -152,18 +154,17 @@ class SmartRoadAlertHost:
             return
 
         def camera_loop() -> None:
-            # ── 1. Auto-detect first available USB camera ──────────────────
-            cams = glob.glob("/dev/video*")
-            cam_path = cams[0] if cams else "/dev/video0"
-            cap = cv2.VideoCapture(cam_path)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(0)  # index-based fallback
-            if not cap.isOpened():
-                logger.error(
-                    "Camera inference: could not open any camera — thread exiting."
-                )
+            # ── 1. Build depthai v3 pipeline ───────────────────────────────
+            try:
+                oak_pipeline = dai.Pipeline()
+                oak_cam = oak_pipeline.create(dai.node.Camera).build()
+                videoOut = oak_cam.requestOutput((640, 480), type=dai.ImgFrame.Type.BGR888p)
+                q = videoOut.createOutputQueue()
+                oak_pipeline.start()
+                logger.info("Camera inference: OAK camera pipeline started.")
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Camera inference: failed to start OAK pipeline: %s", exc)
                 return
-            logger.info("Camera inference: opened camera at %s.", cam_path)
 
             # ── 2. Load YOLOv8n model ──────────────────────────────────────
             try:
@@ -171,17 +172,14 @@ class SmartRoadAlertHost:
                 logger.info("Camera inference: YOLOv8n model loaded.")
             except Exception as exc:  # noqa: BLE001
                 logger.error("Camera inference: failed to load YOLOv8n model: %s", exc)
-                cap.release()
+                oak_pipeline.stop()
                 return
 
             # ── 3. Inference loop ──────────────────────────────────────────
-            while self._camera_running:
-                ret, frame = cap.read()
-                if not ret:
-                    logger.warning(
-                        "Camera inference: failed to read frame — retrying."
-                    )
-                    time.sleep(0.5)
+            while self._camera_running and oak_pipeline.isRunning():
+                frame = q.get().getCvFrame()
+                if frame is None:
+                    time.sleep(0.1)
                     continue
 
                 # ── 4. Run inference ───────────────────────────────────────
@@ -210,7 +208,7 @@ class SmartRoadAlertHost:
                 # ── Minimal sleep to prevent CPU saturation ────────────────
                 time.sleep(0.03)
 
-            cap.release()
+            oak_pipeline.stop()
             logger.info("Camera inference thread stopped.")
 
         self._camera_running = True
