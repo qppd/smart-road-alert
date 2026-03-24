@@ -32,6 +32,7 @@ from __future__ import annotations
 import glob
 import json
 import logging
+import os
 import signal
 import sys
 import threading
@@ -153,6 +154,12 @@ class SmartRoadAlertHost:
             )
             return
 
+        # Bounding box colours (Tableau 10)
+        _BBOX_COLORS = [
+            (164,120,87),(68,148,228),(93,97,209),(178,182,133),(88,159,106),
+            (96,202,231),(159,124,168),(169,162,241),(98,118,150),(172,176,184),
+        ]
+
         def camera_loop() -> None:
             # ── 1. Build depthai v3 pipeline ───────────────────────────────
             try:
@@ -166,12 +173,15 @@ class SmartRoadAlertHost:
                 logger.error("Camera inference: failed to start OAK pipeline: %s", exc)
                 return
 
-            # ── 2. Load YOLOv8n model ──────────────────────────────────────
+            # ── 2. Auto-load ncnn model (relative to this script) ──────────
+            _script_dir = os.path.dirname(os.path.abspath(__file__))
+            _ncnn_model_path = os.path.join(_script_dir, "yolov8n_ncnn_model")
             try:
-                model = _YOLO("yolov8n.pt")
-                logger.info("Camera inference: YOLOv8n model loaded.")
+                model = _YOLO(_ncnn_model_path, task="detect")
+                labels = model.names
+                logger.info("Camera inference: ncnn model loaded from %s.", _ncnn_model_path)
             except Exception as exc:  # noqa: BLE001
-                logger.error("Camera inference: failed to load YOLOv8n model: %s", exc)
+                logger.error("Camera inference: failed to load ncnn model: %s", exc)
                 oak_pipeline.stop()
                 return
 
@@ -190,17 +200,37 @@ class SmartRoadAlertHost:
                     time.sleep(0.1)
                     continue
 
-                # ── 5. Log detections and invoke optional hook ─────────────
+                # ── 5. Draw bounding boxes and collect detections ──────────
                 detections: list[dict] = []
-                for result in results:
-                    for box in result.boxes:
-                        cls_id = int(box.cls[0])
-                        conf   = float(box.conf[0])
-                        label  = model.names.get(cls_id, str(cls_id))
-                        detections.append({"label": label, "confidence": conf})
-                        logger.info(
-                            "Camera detection: %s (confidence: %.2f)", label, conf
-                        )
+                raw_boxes = results[0].boxes
+                for i in range(len(raw_boxes)):
+                    conf = raw_boxes[i].conf.item()
+                    if conf < 0.5:
+                        continue
+                    xyxy  = raw_boxes[i].xyxy.cpu().numpy().squeeze().astype(int)
+                    xmin, ymin, xmax, ymax = xyxy
+                    cls_id    = int(raw_boxes[i].cls.item())
+                    classname = labels[cls_id]
+                    color     = _BBOX_COLORS[cls_id % 10]
+
+                    cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
+                    label_text = f"{classname}: {int(conf*100)}%"
+                    (lw, lh), bl = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    label_ymin  = max(ymin, lh + 10)
+                    cv2.rectangle(frame, (xmin, label_ymin-lh-10),
+                                  (xmin+lw, label_ymin+bl-10), color, cv2.FILLED)
+                    cv2.putText(frame, label_text, (xmin, label_ymin-7),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+                    detections.append({"label": classname, "confidence": conf})
+                    logger.info("Camera detection: %s (confidence: %.2f)", classname, conf)
+
+                cv2.putText(frame, f"Objects: {len(detections)}", (10, 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.imshow("Smart Road Alert — YOLO", frame)
+                if cv2.waitKey(1) == ord('q'):
+                    self._camera_running = False
+                    break
 
                 if detections:
                     self._on_inference_detections(detections)
@@ -209,6 +239,7 @@ class SmartRoadAlertHost:
                 time.sleep(0.03)
 
             oak_pipeline.stop()
+            cv2.destroyAllWindows()
             logger.info("Camera inference thread stopped.")
 
         self._camera_running = True
