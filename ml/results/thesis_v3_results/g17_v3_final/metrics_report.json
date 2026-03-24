@@ -1,0 +1,25 @@
+{
+  "summary": {
+    "mAP@50": 0.8815,
+    "mAP@50-95": 0.6833,
+    "Precision": 0.9022,
+    "Recall": 0.8239,
+    "F1": 0.8613,
+    "training_hrs": 6.86
+  },
+  "per_class_AP50": {
+    "ambulance": 0.784,
+    "bicycle": 0.7908,
+    "bus": 0.9182,
+    "car": 0.9488,
+    "ev_large": 0.4399,
+    "ev_small": 0.9749,
+    "fire_truck": 0.9661,
+    "jeepney": 0.9538,
+    "kalesa": 0.9493,
+    "kariton": 0.9676,
+    "motorcycle": 0.8936,
+    "pedicab": 0.8771,
+    "police_car": 0.995
+  }
+}
