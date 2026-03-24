@@ -112,6 +112,8 @@ class SmartRoadAlertHost:
         self._t_last_hc12_ping   = 0.0
         self._camera_thread: Optional[threading.Thread] = None
         self._camera_running: bool = False
+        self._latest_frame: Optional[object] = None
+        self._frame_lock: threading.Lock = threading.Lock()
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -133,6 +135,8 @@ class SmartRoadAlertHost:
             self._camera_thread.join(timeout=2)
         if self._serial is not None:
             self._serial.stop()
+        if _CAMERA_INFERENCE_AVAILABLE and cv2 is not None:
+            cv2.destroyAllWindows()
         logger.info("Shutdown complete.")
 
     # ─── Camera Inference ─────────────────────────────────────────────────────
@@ -227,10 +231,8 @@ class SmartRoadAlertHost:
 
                 cv2.putText(frame, f"Objects: {len(detections)}", (10, 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                cv2.imshow("Smart Road Alert — YOLO", frame)
-                if cv2.waitKey(1) == ord('q'):
-                    self._camera_running = False
-                    break
+                with self._frame_lock:
+                    self._latest_frame = frame
 
                 if detections:
                     self._on_inference_detections(detections)
@@ -239,7 +241,6 @@ class SmartRoadAlertHost:
                 time.sleep(0.03)
 
             oak_pipeline.stop()
-            cv2.destroyAllWindows()
             logger.info("Camera inference thread stopped.")
 
         self._camera_running = True
@@ -306,6 +307,16 @@ class SmartRoadAlertHost:
                     self._t_last_hc12_ping = now
                     self.send_via_hc12({"type": "RPI_PING", "node": NODE_ID})
                     logger.info("Sent RPI_PING via HC-12 (node=%s).", NODE_ID)
+
+            # ── Display latest camera frame on the main thread (GUI calls must
+            #    not run from a daemon thread — black frames are a threading issue)
+            if CAMERA_INFERENCE_ENABLED and _CAMERA_INFERENCE_AVAILABLE and cv2 is not None:
+                with self._frame_lock:
+                    frame = self._latest_frame
+                if frame is not None:
+                    cv2.imshow("Smart Road Alert — YOLO", frame)
+                    if cv2.waitKey(1) == ord('q'):
+                        self._camera_running = False
 
             time.sleep(POLL_INTERVAL_S)
 
