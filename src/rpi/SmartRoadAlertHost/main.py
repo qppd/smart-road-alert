@@ -191,7 +191,7 @@ class SmartRoadAlertHost:
 
             # ── 2. Auto-load ncnn model (relative to this script) ──────────
             _script_dir = os.path.dirname(os.path.abspath(__file__))
-            _ncnn_model_path = os.path.join(_script_dir, "yolov8n_ncnn_model")
+            _ncnn_model_path = os.path.join(_script_dir, "best_ncnn_model")
             try:
                 model = _YOLO(_ncnn_model_path, task="detect")
                 labels = model.names
