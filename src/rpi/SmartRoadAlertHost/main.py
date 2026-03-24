@@ -203,7 +203,11 @@ class SmartRoadAlertHost:
 
             # ── 3. Inference loop ──────────────────────────────────────────
             while self._camera_running and oak_pipeline.isRunning():
-                frame = q.get().getCvFrame()
+                # .copy() is critical: getCvFrame() may return a view into a
+                # DepthAI-owned buffer that is recycled on the next q.get().
+                # Without the copy, self._latest_frame silently becomes all-zeros
+                # (black screen) the moment a new frame is dequeued.
+                frame = q.get().getCvFrame().copy()
                 if frame is None:
                     time.sleep(0.1)
                     continue
@@ -245,6 +249,10 @@ class SmartRoadAlertHost:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 with self._frame_lock:
                     self._latest_frame = frame
+                logger.info(
+                    "Camera inference: frame updated — shape=%s dtype=%s",
+                    frame.shape, frame.dtype,
+                )
 
                 if detections:
                     self._on_inference_detections(detections)
@@ -290,6 +298,12 @@ class SmartRoadAlertHost:
         """
         logger.info("Main loop running. Press Ctrl+C to stop.")
 
+        # Pre-create the display window in the main thread before the loop so
+        # that the first cv2.imshow() call does not have to initialise the
+        # window mid-loop (avoids black-frame on some X11 / Wayland compositors).
+        if CAMERA_INFERENCE_ENABLED and _CAMERA_INFERENCE_AVAILABLE and cv2 is not None:
+            cv2.namedWindow("Smart Road Alert — YOLO", cv2.WINDOW_NORMAL)
+
         while self._running:
             now = time.monotonic()
 
@@ -323,8 +337,21 @@ class SmartRoadAlertHost:
             # ── Display latest camera frame on the main thread (GUI calls must
             #    not run from a daemon thread — black frames are a threading issue)
             if CAMERA_INFERENCE_ENABLED and _CAMERA_INFERENCE_AVAILABLE and cv2 is not None:
+                # Take a copy under the lock so the camera thread is free to
+                # write the next frame without blocking the renderer.
                 with self._frame_lock:
-                    frame = self._latest_frame
+                    frame = (
+                        self._latest_frame.copy()
+                        if self._latest_frame is not None
+                        else None
+                    )
+
+                # ── Debug instrumentation ──────────────────────────────────
+                print(frame is None, frame.shape if frame is not None else None)
+                if frame is not None:
+                    cv2.imwrite("debug.jpg", frame)  # inspect on disk if display is broken
+                # ─────────────────────────────────────────────────────────
+
                 if frame is not None:
                     cv2.imshow("Smart Road Alert — YOLO", frame)
                 key = cv2.waitKey(30)
