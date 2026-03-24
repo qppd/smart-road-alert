@@ -45,12 +45,24 @@ from serial_config import SerialManager
 
 # ─── Logging Configuration ────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    stream=sys.stdout,
-)
+
+# ─── Logging to Console and File ─────────────────────────────────────────────
+LOG_FILE_PATH = os.path.join(os.path.dirname(__file__), "smart_road_alert.log.txt")
+log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+file_handler = logging.FileHandler(LOG_FILE_PATH, mode="a", encoding="utf-8")
+file_handler.setFormatter(log_formatter)
+file_handler.setLevel(logging.INFO)
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(log_formatter)
+console_handler.setLevel(logging.INFO)
+
 logger = logging.getLogger("SmartRoadAlert")
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
 
 # ─── Optional Camera Inference Imports ────────────────────────────────────────
 
