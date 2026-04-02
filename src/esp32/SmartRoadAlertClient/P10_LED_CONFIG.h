@@ -9,28 +9,23 @@
 // =======================================================================
 // P10 Full-Color Panel  |  32x16 px, 1/4-scan, HUB75, SMD3535
 //
-// PHYSICAL CHAIN (left → right, viewed from front):
+// PHYSICAL CHAIN (left -> right, viewed from front):
 //
-//   ESP32 ──► [PANEL A IN]──[PANEL A OUT]──►[PANEL B IN]──[PANEL B OUT]──►[PANEL C IN]
+//   ESP32 -> [PANEL A IN]--[PANEL A OUT]-->[PANEL B IN]--[PANEL B OUT]-->[PANEL C IN]
 //
-//   PANEL A  │  PANEL B  │  PANEL C
-//   [LEFT]   │  [MIDDLE] │  [RIGHT]
-//   90° CW   │  90° CCW  │  90° CW
+// Stock orientation: no per-panel 90-degree rotation remap.
+// Each panel stays 32x16 logical, so three chained panels are 96x16.
 //
-// Each physical 32×16 panel stands upright after rotation → 16×32 logical.
-// Three panels side-by-side → 48×32 total logical canvas.
-//
-// "64×8 DMA TRICK": each panel is declared as 64-wide × 8-tall so the
-// library is forced into 1/4-scan multiplexing.  The CustomMatrix mapper
-// converts logical (x,y) → correct DMA address in three steps:
-//   A) rotate  B) 1/4-scan remap  C) chain offset
+// "64x8 DMA trick": each panel is still declared as 64x8 to match
+// this panel's 1/4-scan electrical layout. CustomMatrix only applies
+// 1/4-scan remap + chain offset in this mode.
 // =======================================================================
 #define PANEL_RES_X     64   // 1/4-scan trick: 32 physical cols -> 64 DMA cols
 #define PANEL_RES_Y     8    // 1/4-scan trick: 16 physical rows -> 8 DMA rows
 #define PANEL_CHAIN     3    // Number of P10 panels chained
 
-#define P10_LOGICAL_W   48   // Logical width  (PANEL_CHAIN * 16, rotated)
-#define P10_LOGICAL_H   32   // Logical height (32 rows after 90-deg rotation)
+#define P10_LOGICAL_W   96   // Logical width  (PANEL_CHAIN * 32, stock orientation)
+#define P10_LOGICAL_H   16   // Logical height (16 rows per panel)
 
 // HUB75 Pin Definitions — numeric values are centralised in PINS_CONFIG.h.
 // These aliases preserve backward compatibility with P10_LED_CONFIG.cpp.
@@ -48,7 +43,7 @@
 #define P_CLK PIN_P10_CLK
 
 // Custom Adafruit_GFX subclass that remaps logical coordinates to the
-// physical DMA buffer via S-shape rotation + 1/4-scan addressing.
+// physical DMA buffer via 1/4-scan addressing.
 class CustomMatrix : public Adafruit_GFX {
 public:
     MatrixPanel_I2S_DMA *dma;

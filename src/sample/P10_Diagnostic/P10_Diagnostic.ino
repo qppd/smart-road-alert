@@ -19,8 +19,6 @@
 #define PANEL_RES_Y    8   
 #define PANEL_CHAIN    3   
 
-#define PANEL_PIXEL_BASE 4
-
 #define LOGICAL_W     96
 #define LOGICAL_H     16
 
@@ -54,11 +52,12 @@ public:
 
    
         int16_t dma_x, dma_y;
-        dma_y = (py_local >> 3) * 4 + (py_local & 0x03);
-        if ((py_local & 0x04) == 0) {
-            dma_x = px_local + ((px_local / PANEL_PIXEL_BASE) * PANEL_PIXEL_BASE);
+        if (py_local < 8) {
+            dma_x = px_local;
+            dma_y = py_local;
         } else {
-            dma_x = px_local + (((px_local / PANEL_PIXEL_BASE) + 1) * PANEL_PIXEL_BASE);
+            dma_x = px_local + 32;
+            dma_y = py_local - 8;
         }
 
         // ── STEP C: Chain panel offset (each panel = 64 DMA columns) ────
