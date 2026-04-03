@@ -1,237 +1,182 @@
-// =============================================================================
-// P10Led.ino - Standalone P10 LED test sketch for ESP32
-// No external .h/.cpp files needed. Flash and run directly.
-//
-// Hardware: 3x P10 Full-Color HUB75 32x16 1/4-scan panels chained:
-//   ESP32 -> [PANEL A IN]--[A OUT]-->[PANEL B IN]--[B OUT]-->[PANEL C IN]
-//
-// The ESP32-HUB75-MatrixPanel-I2S-DMA core is designed for HALF-scan DMA output.
-// For QUARTER-scan P10 panels, this sketch uses a virtual display remap class
-// that transforms logical coordinates before calling dma->drawPixel().
-//
-// Logical canvas: 96 wide x 16 tall (stock panel orientation)
-// =============================================================================
+/*************************************************************************
+   Description:
 
-#include <Adafruit_GFX.h>
-#include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+   The underlying implementation of the ESP32-HUB75-MatrixPanel-I2S-DMA only
+   supports output to HALF scan panels - which means outputting
+   two lines at the same time, 16 or 32 rows apart if a 32px or 64px high panel
+   respectively.
+   This cannot be changed at the DMA layer as it would require a messy and complex
+   rebuild of the library's internals.
 
-#define PANEL_RES_X   64    
-#define PANEL_RES_Y    8   
-#define PANEL_CHAIN    3   
+   However, it is possible to connect QUARTER (i.e. FOUR lines updated in parallel)
+   scan panels to this same library and
+   'trick' the output to work correctly on these panels by way of adjusting the
+   pixel co-ordinates that are 'sent' to the ESP32-HUB75-MatrixPanel-I2S-DMA
+   library.
 
-#define LOGICAL_W     96
-#define LOGICAL_H     16
+ **************************************************************************/
 
-#define P_R1   4
-#define P_G1   5
-#define P_B1  15
-#define P_R2  25
-#define P_G2  18
-#define P_B2  26
-#define P_A   27
-#define P_B   19
-#define P_C   14
-#define P_LAT 23
-#define P_OE  13
-#define P_CLK 21
+/* Use the Virtual Display class to re-map co-ordinates such that they draw
+   correctly on a 32x16 1/4 or 64x32 1/8 Scan panel (or chain of such panels).
+*/
+#include "ESP32-VirtualMatrixPanel-I2S-DMA.h"
 
-class VirtualQuarterScanDisplay : public Adafruit_GFX {
-public:
-    MatrixPanel_I2S_DMA *dma;
+// Define custom class derived from VirtualMatrixPanel
+class CustomPxBasePanel : public VirtualMatrixPanel
+{
+  public:
+    using VirtualMatrixPanel::VirtualMatrixPanel; // inherit VirtualMatrixPanel's constructor(s)
 
-    explicit VirtualQuarterScanDisplay(MatrixPanel_I2S_DMA *d)
-        : Adafruit_GFX(LOGICAL_W, LOGICAL_H), dma(d) {}
+  protected:
 
-    void drawPixel(int16_t x, int16_t y, uint16_t color) override {
-        if (x < 0 || x >= LOGICAL_W || y < 0 || y >= LOGICAL_H) return;
+    VirtualCoords getCoords(int16_t x, int16_t y);  // custom getCoords() method for specific pixel mapping
 
-        int16_t px_local, py_local, panel_index;
-        panel_index = x / 32;
-        px_local = x % 32;
-        py_local = y;
-
-   
-        int16_t dma_x, dma_y;
-        if (py_local < 8) {
-            dma_x = px_local;
-            dma_y = py_local;
-        } else {
-            dma_x = px_local + 32;
-            dma_y = py_local - 8;
-        }
-
-        // ── STEP C: Chain panel offset (each panel = 64 DMA columns) ────
-        dma_x += panel_index * 64;
-
-        dma->drawPixel(dma_x, dma_y, color);
-    }
 };
 
+// custom getCoords() method for specific pixel mapping
+inline VirtualCoords CustomPxBasePanel ::getCoords(int16_t x, int16_t y) {
 
+  coords = VirtualMatrixPanel::getCoords(x, y); // call base class method to update coords for chaining approach
+
+  if ( coords.x == -1 || coords.y == -1 ) { // Co-ordinates go from 0 to X-1 remember! width() and height() are out of range!
+    return coords;
+  }
+
+  uint8_t pxbase = panelResX;  // pixel base
+  // mapper for panels with 32 pixs height  (64x32 or 32x32)
+  if (panelResY == 32)
+  {
+    if ((coords.y & 8) == 0)
+    {
+      coords.x += ((coords.x / pxbase) + 1) * pxbase;    // 1st, 3rd 'block' of 8 rows of pixels
+    }
+    else
+    {
+      coords.x += (coords.x / pxbase) * pxbase;          // 2nd, 4th 'block' of 8 rows of pixels
+    }
+    coords.y = (coords.y >> 4) * 8 + (coords.y & 0b00000111);
+  }
+
+  // mapper for panels with 16 pixs height  (32x16 1/4)
+  else if (panelResY == 16)
+  {
+    if ((coords.y & 4) == 0)
+    {
+      // 1. Normal line, from left to right
+      coords.x += ((coords.x / pxbase) + 1) * pxbase;     // 1st, 3rd 'block' of 4 rows of pixels
+      //2. in case the line filled from right to left, use this (and comment 1st)
+      //coords.x = ((coords.x / pxbase) + 1) * 2 * pxbase  - (coords.x % pxbase) - 1;
+    }
+    else
+    {
+      coords.x += (coords.x / pxbase) * pxbase;          // 2nd, 4th 'block' of 4 rows of pixels
+    }
+    coords.y = (coords.y >> 3) * 4 + (coords.y & 0b00000011);
+  }
+  // mapper for panels with any other heights
+  else {
+    uint8_t half_height = panelResY / 2;
+   
+    if ((coords.y  % half_height ) < half_height/2)
+    {
+     coords.x += (coords.x / pxbase + 1) * pxbase;
+    }
+    else
+    {
+     coords.x += (coords.x / pxbase) * pxbase; // 2nd, 4th 'block' of 8 rows of pixels, offset by panel width in DMA buffer
+     }
+     
+     coords.y = (coords.y / half_height ) * (half_height/2) + (coords.y % (half_height/2));
+
+  }
+  return coords;
+}
+
+// Panel configuration
+#define PANEL_RES_X 32 // Number of pixels wide of each INDIVIDUAL panel module. 
+#define PANEL_RES_Y 16 // Number of pixels tall of each INDIVIDUAL panel module.
+
+// Use a single panel for tests
+#define NUM_ROWS 1 // Number of rows of chained INDIVIDUAL PANELS
+#define NUM_COLS 1 // Number of INDIVIDUAL PANELS per ROW
+
+// Chain settings, do not cnahge
+#define SERPENT true
+#define TOPDOWN false
+#define VIRTUAL_MATRIX_CHAIN_TYPE CHAIN_BOTTOM_RIGHT_UP
+
+// placeholder for the matrix object
 MatrixPanel_I2S_DMA *dma_display = nullptr;
-VirtualQuarterScanDisplay *matrix = nullptr;
+
+// placeholder for the virtual display object
+CustomPxBasePanel   *FourScanPanel = nullptr;
+
+#define R1_PIN 4
+#define G1_PIN 5
+#define B1_PIN 15
+#define R2_PIN 25
+#define G2_PIN 18
+#define B2_PIN 26
+#define A_PIN 27
+#define B_PIN 19
+#define C_PIN 14
+#define D_PIN 12
+#define E_PIN -1
+#define LAT_PIN 23
+#define OE_PIN 13
+#define CLK_PIN 21
+
+/******************************************************************************
+   Setup!
+ ******************************************************************************/
+void setup()
+{
+  HUB75_I2S_CFG::i2s_pins _pins={R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN, A_PIN, B_PIN, C_PIN, D_PIN, E_PIN, LAT_PIN, OE_PIN, CLK_PIN};
+  HUB75_I2S_CFG mxconfig(
+    PANEL_RES_X * 2,            // DO NOT CHANGE THIS
+    PANEL_RES_Y / 2,            // DO NOT CHANGE THIS
+    NUM_ROWS * NUM_COLS         // DO NOT CHANGE THIS
+    ,_pins            // Uncomment to enable custom pins
+  );
+
+  // Change this if you see pixels showing up shifted wrongly by one column the left or right.
+  mxconfig.clkphase = false; 
+  
+  // Uncomment this to use a TYPE595 decoder like DP32020/SM5368/TC75xx
+  //mxconfig.line_decoder = HUB75_I2S_CFG::TYPE595;
+
+  // Driver
+  mxconfig.driver = HUB75_I2S_CFG::MBI5124;
+
+  // OK, now we can create our matrix object
+  dma_display = new MatrixPanel_I2S_DMA(mxconfig);
+
+  // let's adjust default brightness to about 75%
+  dma_display->setBrightness8(1);    // range is 0-255, 0 - 0%, 255 - 100%
+
+  // Allocate memory and start DMA display
+  if ( not dma_display->begin() )
+    Serial.println("****** !KABOOM! I2S memory allocation failed ***********");
 
 
-inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
-    return dma_display->color565(r, g, b);
+  dma_display->clearScreen();
+  delay(500);
+
+  // create FourScanPanellay object based on our newly created dma_display object
+  FourScanPanel = new CustomPxBasePanel ((*dma_display), NUM_ROWS, NUM_COLS, PANEL_RES_X, PANEL_RES_Y,  VIRTUAL_MATRIX_CHAIN_TYPE);
+
 }
 
-
-
-void testSolidColors() {
-    uint16_t colors[] = {
-        rgb(255,   0,   0),   // red
-        rgb(  0, 255,   0),   // green
-        rgb(  0,   0, 255),   // blue
-        rgb(255, 255,   0),   // yellow
-        rgb(  0, 255, 255),   // cyan
-        rgb(255,   0, 255),   // magenta
-        rgb(255, 255, 255),   // white
-    };
-    for (uint16_t c : colors) {
-        matrix->fillScreen(c);
-        delay(600);
-    }
-    matrix->fillScreen(0);
-}
-
-void testBorder() {
-    matrix->fillScreen(0);
-    matrix->drawRect(0, 0, LOGICAL_W, LOGICAL_H, rgb(255, 0, 0));
-    // Vertical seam lines for A|B and B|C panel boundaries
-    matrix->drawFastVLine(31, 0, LOGICAL_H, rgb(0, 255, 0));
-    matrix->drawFastVLine(32, 0, LOGICAL_H, rgb(0, 255, 0));
-    matrix->drawFastVLine(63, 0, LOGICAL_H, rgb(0, 0, 255));
-    matrix->drawFastVLine(64, 0, LOGICAL_H, rgb(0, 0, 255));
-    delay(2000);
-}
-
-
-void testGradient() {
-    matrix->fillScreen(0);
-    for (int16_t x = 0; x < LOGICAL_W; x++) {
-        uint8_t shade = map(x, 0, LOGICAL_W - 1, 10, 255);
-        uint16_t col = rgb(shade, 0, 255 - shade);
-        matrix->drawFastVLine(x, 0, LOGICAL_H, col);
-    }
-    delay(2000);
-}
-
-
-void testPixelWalk() {
-    matrix->fillScreen(0);
-    for (int16_t y = 0; y < LOGICAL_H; y++) {
-        for (int16_t x = 0; x < LOGICAL_W; x++) {
-            matrix->drawPixel(x, y, rgb(0, 255, 80));
-            delay(8);
-            matrix->drawPixel(x, y, 0);
-        }
-    }
-}
-
-void testVehicleDisplay(float speed, float distance, bool safe) {
-    matrix->fillScreen(0);
-
-    matrix->drawRect(0, 0, LOGICAL_W, LOGICAL_H, rgb(60, 60, 60));
-
-    matrix->setTextSize(1);
-    matrix->setTextColor(rgb(255, 80, 0));
-    matrix->setCursor(2, 4);
-    matrix->print("SPD");
-
-    char buf[16];
-    matrix->setTextColor(rgb(255, 220, 0));
-    matrix->setCursor(22, 4);
-    snprintf(buf, sizeof(buf), "%.0fkm/h", speed);
-    matrix->print(buf);
-
-    matrix->setTextColor(rgb(0, 200, 255));
-    matrix->setCursor(52, 4);
-    matrix->print("DST");
-
-    matrix->setCursor(70, 4);
-    snprintf(buf, sizeof(buf), "%.1fm", distance);
-    matrix->print(buf);
-
-    if (safe) {
-        matrix->setTextColor(rgb(0, 255, 0));
-        matrix->setCursor(88, 4);
-        matrix->print("GO");
-    } else {
-        matrix->setTextColor(rgb(255, 0, 0));
-        matrix->setCursor(86, 4);
-        matrix->print("STP");
-    }
-}
-
-
-void testScrollText(const char *msg, uint16_t color) {
-    int16_t textW = strlen(msg) * 6; 
-    matrix->setTextSize(1);
-    matrix->setTextColor(color);
-    for (int16_t xPos = LOGICAL_W; xPos > -textW; xPos--) {
-        matrix->fillScreen(0);
-        matrix->setCursor(xPos, 4);
-        matrix->print(msg);
-        delay(40);
-    }
-}
-
-void setup() {
-    Serial.begin(115200);
-    Serial.println("P10 LED test starting...");
-
-    HUB75_I2S_CFG cfg(PANEL_RES_X, PANEL_RES_Y, PANEL_CHAIN);
-    cfg.gpio.r1  = P_R1;  cfg.gpio.g1  = P_G1;  cfg.gpio.b1  = P_B1;
-    cfg.gpio.r2  = P_R2;  cfg.gpio.g2  = P_G2;  cfg.gpio.b2  = P_B2;
-    cfg.gpio.a   = P_A;   cfg.gpio.b   = P_B;   cfg.gpio.c   = P_C;
-    cfg.gpio.d   = -1;    cfg.gpio.e   = -1;
-    cfg.gpio.lat = P_LAT; cfg.gpio.oe  = P_OE;  cfg.gpio.clk = P_CLK;
-
-    // Verified config for this 32x16 1/4-scan P10 variant (74HC138D + 6124DJ).
-    cfg.driver         = HUB75_I2S_CFG::FM6126A;
-    cfg.line_decoder   = HUB75_I2S_CFG::TYPE138;
-    cfg.i2sspeed       = HUB75_I2S_CFG::HZ_10M;
-    cfg.clkphase       = false;
-    cfg.latch_blanking = 4;
-
-    dma_display = new MatrixPanel_I2S_DMA(cfg);
-    dma_display->begin();
-    dma_display->setBrightness8(90);
-    dma_display->clearScreen();
-
-    matrix = new VirtualQuarterScanDisplay(dma_display);
-    matrix->setTextWrap(false);
-
-    Serial.println("Setup done.");
-}
 
 void loop() {
-    Serial.println("== Solid color fill ==");
-    testSolidColors();
-    delay(300);
-
-    Serial.println("== Border + seam lines ==");
-    testBorder();
-    delay(300);
-
-    Serial.println("== Horizontal gradient ==");
-    testGradient();
-    delay(300);
-
-    Serial.println("== Pixel walk ==");
-    testPixelWalk();
-    delay(300);
-
-    Serial.println("== Vehicle display: SAFE ==");
-    testVehicleDisplay(42.0f, 12.3f, true);
-    delay(2500);
-
-    Serial.println("== Vehicle display: DANGER ==");
-    testVehicleDisplay(80.0f, 3.1f, false);
-    delay(2500);
-
-    Serial.println("== Scroll text ==");
-    testScrollText("SMART ROAD ALERT", rgb(255, 200, 0));
-    delay(300);
-}
+  for (int i = 0; i < FourScanPanel->height(); i++)
+  {
+    for (int j = 0; j < FourScanPanel->width(); j++)
+    {
+      FourScanPanel->drawPixel(j, i, FourScanPanel->color565(255, 0, 0));
+      delay(5);
+    }
+  }
+  delay(2000);
+  dma_display->clearScreen();
+} // end loop
