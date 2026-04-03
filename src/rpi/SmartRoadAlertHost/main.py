@@ -574,16 +574,13 @@ class SmartRoadAlertHost:
 
             payload = {
                 "type":             "vehicle",
-                "track_id":         tid,
                 "label":            label,
                 "priority":         priority,
                 "direction":        direction,
                 "speed":            speed_kmh,
                 "distance":         distance,
                 "emergency_active": emergency_active,
-                "confidence":       round(conf, 2),
                 "node":             NODE_ID,
-                "timestamp":        time.time(),
             }
 
             logger.info(

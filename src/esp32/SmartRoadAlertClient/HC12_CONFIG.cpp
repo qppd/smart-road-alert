@@ -85,12 +85,16 @@ void hc12_update(void) {
         } else if (c == '\r') {
             // Carriage-return silently ignored
         } else {
-            if (s_rx_idx < HC12_RX_BUF - 1) {
+            // Discard any bytes that arrive before '{' — these are radio-sync
+            // preamble artifacts from HC-12 FU3 carrier acquisition.  Once
+            // we see '{' (JSON start) we accumulate normally.
+            if (s_rx_idx == 0 && c != '{') {
+                /* skip pre-JSON preamble */
+            } else if (s_rx_idx < HC12_RX_BUF - 1) {
                 s_rx_buf[s_rx_idx++] = c;
             } else {
                 // Buffer overflow — discard the partial frame and reset
                 s_rx_idx = 0;
-                /* RX buffer overflow: frame discarded */
             }
         }
     }
