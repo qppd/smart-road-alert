@@ -175,24 +175,10 @@ static void handle_incoming_message(const SerialMessage &msg) {
 // ─── Sensor Telemetry ─────────────────────────────────────────────────────────
 
 static void poll_and_send_sensor_data(void) {
-    unsigned long now = millis();
-
-    // Rate-limit without blocking
-    if (now - s_last_sensor_poll_ms < SENSOR_POLL_INTERVAL_MS) {
-        return;
-    }
-    s_last_sensor_poll_ms = now;
-
-    s_speed    = 42.0f + static_cast<float>(now % 10);
-    s_distance = 12.3f + static_cast<float>(now % 5);
-    s_safe     = (s_speed < 60.0f);
-
-    // Build JSON payload
-    char payload[SERIAL_TX_BUFFER_SIZE];
-    snprintf(payload, sizeof(payload),
-             "{\"type\":\"vehicle\",\"speed\":%.1f,\"distance\":%.1f}",
-             s_speed, s_distance);
-    serial_send(payload);
+    // No physical speed/distance sensor is connected.
+    // Vehicle telemetry is provided exclusively by the RPi YOLO camera pipeline.
+    // This function intentionally does nothing until a real sensor is wired up.
+    (void)s_last_sensor_poll_ms;
 }
 
 // ─── JSON Numeric Utility ─────────────────────────────────────────────────────

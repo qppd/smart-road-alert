@@ -878,34 +878,13 @@ class SmartRoadAlertHost:
     def _on_local_vehicle_data(self, data: dict) -> None:
         """
         Process telemetry from the local ESP32 device.
-        
-        1. Validate and log the data.
-        2. Trigger local alerts.
-        3. Forward over HC-12 to the remote RPi.
+
+        NOTE: No physical speed/distance sensor is currently connected to the
+        ESP32.  Vehicle telemetry is provided exclusively by the RPi YOLO
+        camera pipeline.  Any packet arriving here is ignored until a real
+        sensor is wired up and the ESP32 firmware is updated to send real data.
         """
-        speed: Optional[float]    = data.get("speed")
-        distance: Optional[float] = data.get("distance")
-
-        if speed is None or distance is None:
-            logger.warning("Incomplete vehicle packet from ESP32: %s", data)
-            return
-
-        speed    = float(speed)
-        distance = float(distance)
-
-        logger.info(
-            "TELEMETRY → %-12s | %5.1f km/h | dist=%5.1fm | source=esp32",
-            "esp32_sensor", speed, distance,
-        )
-
-        # ── Apply alert thresholds locally ──
-        self._process_vehicle_telemetry(speed, distance, source="local_esp32")
-
-        # ── Forward to the remote RPi via HC-12 ──
-        self.send_via_hc12(
-            {"type": "vehicle", "speed": speed, "distance": distance, "node": NODE_ID}
-        )
-        logger.debug("Forwarded vehicle data to remote RPi via HC-12.")
+        logger.debug("ESP32 sensor packet ignored (no hardware sensor): %s", data)
 
     # ─── HC-12 Send Helper ────────────────────────────────────────────────────
 
