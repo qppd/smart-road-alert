@@ -60,5 +60,6 @@ extern CustomMatrix         *display;
 void setupP10();
 void displayTextP10(const char *text);
 void displayVehicleData(float speed, float distance, bool safe);
+void displayAlert(const char *label, const char *signal, float speed, bool emergency);
 
 #endif // P10_LED_CONFIG_H

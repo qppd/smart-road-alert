@@ -32,11 +32,13 @@ from __future__ import annotations
 import glob
 import json
 import logging
+import math
 import os
 import signal
 import sys
 import threading
 import time
+from collections import deque
 from typing import Optional
 
 import socket
@@ -101,6 +103,90 @@ HC12_PING_INTERVAL_S: float = 5.0
 # Node identifier used in peer-to-peer HC-12 messages (hostname-based).
 NODE_ID: str = socket.gethostname()
 
+# ─── Vehicle Tracking & Speed Estimation Constants ────────────────────────────
+
+# All vehicle classes the YOLO model can detect.
+VEHICLE_CLASSES: list[str] = [
+    "ambulance", "bicycle", "bus", "car", "ev_large", "ev_small",
+    "fire_truck", "jeepney", "kalesa", "kariton", "motorcycle",
+    "pedicab", "police_car", "tricycle", "truck", "tuktuk", "van",
+]
+
+# Emergency vehicle classes — trigger priority alerts.
+_EMERGENCY_CLASSES: frozenset = frozenset({"ambulance", "fire_truck", "police_car"})
+
+# Conversion factor: pixels (linear dimension) → metres.
+# Tune based on camera mounting height and road width visible in frame.
+METERS_PER_PIXEL: float = 0.03
+
+# Minimum inter-frame time gap before speed is computed (seconds).
+_MIN_TIME_DELTA: float = 0.2
+
+# Minimum linear size change (pixels) to consider vehicle moving (noise floor).
+_MIN_SIZE_CHANGE: float = 2.0
+
+# Minimum bounding-box area (pixels²) — filters tiny / noisy detections.
+_MIN_BBOX_AREA: int = 500
+
+# Maximum centroid distance (pixels) to associate a detection with an existing track.
+_MAX_CENTROID_DISTANCE: float = 120.0
+
+# Minimum number of frames a track must be alive before telemetry is sent.
+_MIN_STABLE_FRAMES: int = 3
+
+# Seconds without a detection before a track is discarded.
+_TRACK_TIMEOUT_S: float = 2.0
+
+# Minimum interval between HC-12 telemetry sends per track (seconds).
+_SEND_INTERVAL_S: float = 1.0
+
+# Maximum history entries per track (deque maxlen).
+_TRACK_HISTORY_LEN: int = 10
+
+# ─── Speed Smoothing ──────────────────────────────────────────────────────────
+
+# Exponential moving average factor.  Lower = smoother; higher = responsive.
+_SPEED_EMA_ALPHA: float = 0.3
+
+# Max speed measurements kept per track for variance / acceleration.
+_SPEED_HISTORY_LEN: int = 20
+
+# ─── Distance Estimation (Bbox Fallback) ──────────────────────────────────────
+
+# Reference bbox area (px²) at 1 m.  distance ≈ sqrt(REF / area) metres.
+# Tune per camera mount height and lens field-of-view.
+_REF_BBOX_AREA_AT_1M: float = 50000.0
+
+# ─── Emergency Detection Thresholds ──────────────────────────────────────────
+
+# Minimum speed (km/h) for an emergency vehicle to be considered "active".
+_EMERGENCY_SPEED_THRESHOLD: float = 40.0
+
+# Minimum longitudinal acceleration (m/s²) for emergency inference.
+_EMERGENCY_ACCEL_THRESHOLD: float = 1.5
+
+# Speed standard-deviation (km/h) threshold for erratic-driving detection.
+_EMERGENCY_VARIANCE_THRESHOLD: float = 4.0
+
+# ─── Vehicle Size Classification ─────────────────────────────────────────────
+
+_LARGE_VEHICLES: frozenset = frozenset({
+    "bus", "truck", "van", "jeepney", "ev_large",
+    "fire_truck", "ambulance",
+})
+_MEDIUM_VEHICLES: frozenset = frozenset({
+    "car", "tricycle", "tuktuk", "kariton", "police_car", "ev_small",
+})
+# All others (motorcycle, bicycle, pedicab, kalesa) are implicitly SMALL.
+
+# ─── Alert Signal Thresholds ─────────────────────────────────────────────────
+
+# Speed (km/h) above which a large incoming vehicle triggers STOP.
+_STOP_SPEED_THRESHOLD: float = 60.0
+
+# Speed (km/h) above which a medium incoming vehicle triggers GO SLOW.
+_SLOW_SPEED_THRESHOLD: float = 20.0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SmartRoadAlertHost
@@ -126,6 +212,11 @@ class SmartRoadAlertHost:
         self._camera_running: bool = False
         self._latest_frame: Optional[object] = None
         self._frame_lock: threading.Lock = threading.Lock()
+        # ── Vehicle tracker state (accessed only from the camera-inference thread) ──
+        self._tracks: dict = {}        # {track_id: track_dict}
+        self._next_track_id: int = 0
+        self._overlay_data: list = []  # per-frame overlay items for camera drawing
+        self._current_alert: dict = {} # highest-priority alert currently displayed
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -220,7 +311,7 @@ class SmartRoadAlertHost:
                     time.sleep(0.1)
                     continue
 
-                # ── 5. Draw bounding boxes and collect detections ──────────
+                # ── 5. Collect detections ──────────────────────────────────
                 detections: list[dict] = []
                 raw_boxes = results[0].boxes
                 for i in range(len(raw_boxes)):
@@ -231,31 +322,34 @@ class SmartRoadAlertHost:
                     xmin, ymin, xmax, ymax = xyxy
                     cls_id    = int(raw_boxes[i].cls.item())
                     classname = labels[cls_id]
-                    color     = _BBOX_COLORS[cls_id % 10]
+                    detections.append({
+                        "label": classname,
+                        "confidence": conf,
+                        "bbox": (xmin, ymin, xmax, ymax),
+                    })
 
-                    cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
-                    label_text = f"{classname}: {int(conf*100)}%"
-                    (lw, lh), bl = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                    label_ymin  = max(ymin, lh + 10)
-                    cv2.rectangle(frame, (xmin, label_ymin-lh-10),
-                                  (xmin+lw, label_ymin+bl-10), color, cv2.FILLED)
-                    cv2.putText(frame, label_text, (xmin, label_ymin-7),
+                # ── 6. Track, compute kinematics, build overlay data ───────
+                self._on_inference_detections(detections)
+
+                # ── 7. Draw priority-coloured bounding boxes ───────────────
+                for ov in self._overlay_data:
+                    bx  = ov["bbox"]
+                    col = ov["color"]
+                    txt = ov["text"]
+                    cv2.rectangle(frame, (bx[0], bx[1]), (bx[2], bx[3]), col, 2)
+                    (tw, th), _ = cv2.getTextSize(
+                        txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    ty = max(bx[1], th + 10)
+                    cv2.rectangle(frame, (bx[0], ty - th - 10),
+                                  (bx[0] + tw, ty - 10 + 4), col, cv2.FILLED)
+                    cv2.putText(frame, txt, (bx[0], ty - 7),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-
-                    detections.append({"label": classname, "confidence": conf})
-                    logger.info("Camera detection: %s (confidence: %.2f)", classname, conf)
 
                 cv2.putText(frame, f"Objects: {len(detections)}", (10, 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
                 with self._frame_lock:
                     self._latest_frame = frame
-                logger.info(
-                    "Camera inference: frame updated — shape=%s dtype=%s",
-                    frame.shape, frame.dtype,
-                )
-
-                if detections:
-                    self._on_inference_detections(detections)
 
                 # ── Minimal sleep to prevent CPU saturation ────────────────
                 time.sleep(0.03)
@@ -271,20 +365,313 @@ class SmartRoadAlertHost:
         logger.info("Camera inference thread started.")
 
     def _on_inference_detections(self, detections: list) -> None:
-        """Hook called with each frame's detection results.
+        """Process per-frame detections: track vehicles, estimate direction and
+        speed, and send structured telemetry over HC-12.
 
-        Override or extend this method to route inference output into
-        additional processing pipelines (e.g. ``_process_vehicle_telemetry``)
-        without modifying any existing function signatures.
+        Called from the camera-inference thread; all state it touches
+        (``_tracks``, ``_next_track_id``) is private to that thread.
 
         Parameters
         ----------
         detections:
-            List of dicts with keys ``"label"`` (str) and ``"confidence"``
-            (float) for every bounding box detected in the current frame.
+            List of dicts with keys ``"label"`` (str), ``"confidence"``
+            (float), and ``"bbox"`` (xmin, ymin, xmax, ymax) for every
+            bounding box detected in the current frame.
         """
-        # Default: detections are already logged inside camera_loop; no-op here.
-        pass
+        now = time.monotonic()
+
+        # ── 1. Build candidate objects from raw detections ─────────────────
+        candidates: list[dict] = []
+        for det in detections:
+            bbox = det.get("bbox")
+            if bbox is None:
+                continue
+            xmin, ymin, xmax, ymax = bbox
+            w = max(xmax - xmin, 1)
+            h = max(ymax - ymin, 1)
+            area = w * h
+            if area < _MIN_BBOX_AREA:
+                continue
+            cx = (xmin + xmax) / 2.0
+            cy = (ymin + ymax) / 2.0
+            candidates.append({
+                "label":      det["label"],
+                "confidence": det["confidence"],
+                "bbox":       bbox,
+                "cx":         cx,
+                "cy":         cy,
+                "area":       area,
+                "size":       math.sqrt(area),  # linear proxy for speed
+            })
+
+        # ── 2. Nearest-centroid matching: candidates → existing tracks ──────
+        matched_track_ids: set = set()
+        unmatched: list[dict]  = []
+
+        for obj in candidates:
+            best_id:   Optional[int]   = None
+            best_dist: float           = _MAX_CENTROID_DISTANCE
+
+            for tid, track in self._tracks.items():
+                if tid in matched_track_ids:
+                    continue
+                lx, ly = track["last_pos"]
+                dist = math.sqrt((obj["cx"] - lx) ** 2 + (obj["cy"] - ly) ** 2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_id   = tid
+
+            if best_id is not None:
+                matched_track_ids.add(best_id)
+                t = self._tracks[best_id]
+                t["history"].append((obj["cx"], obj["cy"], obj["area"], obj["size"], now))
+                t["last_seen"]   = now
+                t["last_pos"]    = (obj["cx"], obj["cy"])
+                t["confidence"]  = obj["confidence"]
+                t["bbox"]        = obj["bbox"]
+                t["frames"]      = t.get("frames", 0) + 1
+            else:
+                unmatched.append(obj)
+
+        # ── 3. Spawn new tracks for unmatched candidates ───────────────────
+        for obj in unmatched:
+            tid = self._next_track_id
+            self._next_track_id += 1
+            self._tracks[tid] = {
+                "label":         obj["label"],
+                "history":       deque(
+                    [(obj["cx"], obj["cy"], obj["area"], obj["size"], now)],
+                    maxlen=_TRACK_HISTORY_LEN,
+                ),
+                "speed_history": deque(maxlen=_SPEED_HISTORY_LEN),
+                "last_seen":     now,
+                "last_pos":      (obj["cx"], obj["cy"]),
+                "last_sent":     0.0,
+                "confidence":    obj["confidence"],
+                "bbox":          obj["bbox"],
+                "smooth_speed":  0.0,
+                "frames":        1,
+            }
+
+        # ── 4. Prune stale tracks ──────────────────────────────────────────
+        stale = [tid for tid, t in self._tracks.items()
+                 if now - t["last_seen"] > _TRACK_TIMEOUT_S]
+        for tid in stale:
+            del self._tracks[tid]
+
+        # ── 5. Compute kinematics, build overlays, emit telemetry ──────────
+        self._overlay_data = []
+        best_alert: Optional[dict] = None
+        best_alert_rank = -1
+
+        for tid, track in self._tracks.items():
+            bbox  = track["bbox"]
+            label = track["label"]
+            conf  = track["confidence"]
+            hist  = track["history"]
+
+            if len(hist) < _MIN_STABLE_FRAMES:
+                self._overlay_data.append({
+                    "bbox": bbox, "color": (200, 200, 200),
+                    "text": f"{label} ...",
+                })
+                continue
+
+            # ── Full kinematics ──
+            kin = self._compute_track_kinematics(track)
+            direction  = kin["direction"]
+            speed_kmh  = kin["speed"]
+            distance   = kin["distance"]
+            emergency_active = self._is_emergency_active(track, kin)
+            priority = self._get_priority(label, emergency_active)
+            signal   = self._get_alert_signal(
+                priority, direction, speed_kmh, emergency_active)
+
+            # ── Overlay colour (BGR) ──
+            if emergency_active:
+                color = (0, 0, 255)       # red
+            elif priority == "HIGH":
+                color = (0, 69, 255)      # orange
+            elif priority == "MEDIUM":
+                color = (0, 200, 255)     # yellow
+            else:
+                color = (0, 220, 0)       # green
+            if direction == "outgoing":
+                color = (180, 180, 180)   # gray for receding
+
+            overlay_text = f"{label} {speed_kmh:.0f}km/h {signal}"
+            if emergency_active:
+                overlay_text = f"!! {label} {speed_kmh:.0f}km/h EMERGENCY"
+
+            self._overlay_data.append({
+                "bbox": bbox, "color": color, "text": overlay_text,
+            })
+
+            # ── Rank this track for the display command ──
+            rank = 0
+            if direction == "incoming":
+                rank = 1
+                if priority == "MEDIUM":  rank = 2
+                if priority == "HIGH":    rank = 3
+                if emergency_active:      rank = 4
+            if rank > best_alert_rank:
+                best_alert_rank = rank
+                best_alert = {
+                    "label": label, "signal": signal,
+                    "speed": speed_kmh, "priority": priority,
+                    "emergency": emergency_active,
+                }
+
+            # ── Telemetry (rate-limited per track) ──
+            if now - track["last_sent"] < _SEND_INTERVAL_S:
+                continue
+            track["last_sent"] = now
+
+            payload = {
+                "type":             "vehicle",
+                "track_id":         tid,
+                "label":            label,
+                "priority":         priority,
+                "direction":        direction,
+                "speed":            speed_kmh,
+                "distance":         distance,
+                "emergency_active": emergency_active,
+                "confidence":       round(conf, 2),
+                "node":             NODE_ID,
+                "timestamp":        time.time(),
+            }
+
+            logger.info(
+                "Track[%d] %s dir=%s spd=%.1f dst=%.1fm pri=%s em=%s sig=%s",
+                tid, label, direction, speed_kmh, distance,
+                priority, emergency_active, signal,
+            )
+            if emergency_active and direction == "incoming":
+                logger.warning(
+                    "EMERGENCY ALERT: active %s incoming %.1f km/h", label, speed_kmh)
+
+            self.send_via_hc12(payload)
+
+        # ── Send display command for highest-priority incoming threat ──
+        if best_alert is not None and best_alert["signal"] != "GO":
+            self._send_display_command(**best_alert)
+            self._current_alert = best_alert
+        elif not self._tracks:
+            self._send_display_command("clear", "GO", 0.0, "LOW", False)
+            self._current_alert = {}
+
+    # ─── Kinematics Helpers ───────────────────────────────────────────────────
+
+    def _compute_track_kinematics(self, track: dict) -> dict:
+        """Return direction, smoothed speed, acceleration, variance, distance."""
+        hist_list = list(track["history"])
+
+        # Direction (area trend)
+        first_areas = [e[2] for e in hist_list[:2]]
+        last_areas  = [e[2] for e in hist_list[-2:]]
+        direction = ("incoming"
+                     if sum(last_areas) / len(last_areas)
+                        > sum(first_areas) / len(first_areas)
+                     else "outgoing")
+
+        # Raw speed (linear-size change rate)
+        f, l = hist_list[0], hist_list[-1]
+        dt    = l[4] - f[4]
+        dsize = abs(l[3] - f[3])
+        if dt >= _MIN_TIME_DELTA and dsize >= _MIN_SIZE_CHANGE:
+            raw_speed = (dsize / dt) * METERS_PER_PIXEL * 3.6
+        else:
+            raw_speed = 0.0
+
+        # EMA smoothing
+        prev = track.get("smooth_speed", 0.0)
+        smooth = (raw_speed if prev == 0.0
+                  else _SPEED_EMA_ALPHA * raw_speed + (1 - _SPEED_EMA_ALPHA) * prev)
+        track["smooth_speed"] = smooth
+
+        # Speed history for acceleration / variance
+        now = time.monotonic()
+        sh = track.get("speed_history", deque(maxlen=_SPEED_HISTORY_LEN))
+        sh.append((smooth, now))
+        track["speed_history"] = sh
+
+        # Acceleration (m/s²)
+        accel = 0.0
+        if len(sh) >= 2:
+            s1, t1 = sh[0]
+            s2, t2 = sh[-1]
+            dt_h = t2 - t1
+            if dt_h > 0.3:
+                accel = ((s2 - s1) / 3.6) / dt_h
+
+        # Speed variance (std dev km/h)
+        variance = 0.0
+        if len(sh) >= 3:
+            speeds = [s for s, _ in sh]
+            mean_s = sum(speeds) / len(speeds)
+            variance = math.sqrt(sum((s - mean_s) ** 2 for s in speeds) / len(speeds))
+
+        # Distance from bbox area
+        latest_area = hist_list[-1][2]
+        distance = self._estimate_distance(latest_area)
+
+        return {
+            "direction":      direction,
+            "speed":          round(smooth, 1),
+            "acceleration":   round(accel, 2),
+            "speed_variance": round(variance, 1),
+            "distance":       round(distance, 1),
+        }
+
+    @staticmethod
+    def _estimate_distance(bbox_area: float) -> float:
+        """Approximate distance (m) from bounding-box area."""
+        if bbox_area <= 0:
+            return 999.0
+        return math.sqrt(_REF_BBOX_AREA_AT_1M / bbox_area)
+
+    def _is_emergency_active(self, track: dict, kin: dict) -> bool:
+        """True when an emergency-class vehicle shows active-response kinematics."""
+        if track["label"] not in _EMERGENCY_CLASSES:
+            return False
+        return (kin["speed"] >= _EMERGENCY_SPEED_THRESHOLD
+                or kin["acceleration"] >= _EMERGENCY_ACCEL_THRESHOLD
+                or kin["speed_variance"] >= _EMERGENCY_VARIANCE_THRESHOLD)
+
+    @staticmethod
+    def _get_priority(label: str, emergency_active: bool) -> str:
+        if emergency_active:
+            return "HIGH"
+        if label in _LARGE_VEHICLES:
+            return "HIGH"
+        if label in _MEDIUM_VEHICLES:
+            return "MEDIUM"
+        return "LOW"
+
+    @staticmethod
+    def _get_alert_signal(priority: str, direction: str,
+                          speed: float, emergency_active: bool) -> str:
+        if direction != "incoming":
+            return "GO"
+        if emergency_active:
+            return "STOP"
+        if priority == "HIGH":
+            return "STOP" if speed >= _SLOW_SPEED_THRESHOLD else "GO SLOW"
+        if priority == "MEDIUM":
+            return "GO SLOW" if speed >= _SLOW_SPEED_THRESHOLD else "GO"
+        return "GO"
+
+    def _send_display_command(self, label: str, signal: str, speed: float,
+                              priority: str, emergency: bool) -> None:
+        """Send a display-update command to the local ESP32."""
+        if self._serial is None or not self._serial.is_connected():
+            return
+        cmd = json.dumps({
+            "cmd": "display", "label": label, "signal": signal,
+            "speed": round(speed, 1), "priority": priority,
+            "emergency": emergency,
+        }, separators=(",", ":"))
+        self._serial.send(cmd)
 
     # ─── Main Loop ────────────────────────────────────────────────────────────
 
@@ -346,11 +733,6 @@ class SmartRoadAlertHost:
                         else None
                     )
 
-                # ── Debug instrumentation ──────────────────────────────────
-                print(frame is None, frame.shape if frame is not None else None)
-                if frame is not None:
-                    cv2.imwrite("debug.jpg", frame)  # inspect on disk if display is broken
-                # ─────────────────────────────────────────────────────────
 
                 if frame is not None:
                     cv2.imshow("Smart Road Alert — YOLO", frame)
@@ -464,29 +846,48 @@ class SmartRoadAlertHost:
         logger.debug("HC12_SEND dispatched: %s", inner_json)
 
     def _on_remote_vehicle_data(self, data: dict) -> None:
-        """
-        Process telemetry received from the remote RPi over the HC-12 radio link.
-        
-        1. Validate and log the data.
-        2. Trigger local alerts (e.g., alert siren on this node).
-        """
-        speed: Optional[float]    = data.get("speed")
-        distance: Optional[float] = data.get("distance")
+        """Process vehicle telemetry received from the remote RPi via HC-12.
 
-        if speed is None or distance is None:
+        Handles both legacy ``{speed, distance}`` packets from ESP32 sensors
+        and enriched camera-based telemetry with label, priority, direction.
+        """
+        label     = data.get("label", "vehicle")
+        speed     = data.get("speed")
+        distance  = data.get("distance", 0.0)
+        direction = data.get("direction", "unknown")
+        priority  = data.get("priority", "LOW")
+        emergency = data.get("emergency_active", False)
+        node      = data.get("node", "unknown")
+
+        if speed is None:
             logger.warning("Incomplete vehicle packet from HC-12: %s", data)
             return
 
         speed    = float(speed)
-        distance = float(distance)
+        distance = float(distance) if distance is not None else 0.0
 
         logger.info(
-            "Remote vehicle telemetry (HC-12) — speed: %.1f km/h, distance: %.1f m",
-            speed, distance,
+            "Remote vehicle (from %s): %s dir=%s spd=%.1f km/h dst=%.1fm pri=%s em=%s",
+            node, label, direction, speed, distance, priority, emergency,
         )
 
-        # ── Apply alert thresholds locally ──
-        self._process_vehicle_telemetry(speed, distance, source="remote_rpi")
+        # Sender's "outgoing" means vehicle is heading TOWARD us.
+        local_direction = "incoming" if direction == "outgoing" else "outgoing"
+
+        if local_direction == "incoming":
+            signal = self._get_alert_signal(priority, "incoming", speed, emergency)
+            self._send_display_command(label, signal, speed, priority, emergency)
+
+            if emergency:
+                logger.warning(
+                    "REMOTE EMERGENCY: active %s heading toward us at %.1f km/h",
+                    label, speed,
+                )
+            elif signal in ("STOP", "GO SLOW"):
+                logger.warning(
+                    "REMOTE ALERT: %s toward us at %.1f km/h — %s",
+                    label, speed, signal,
+                )
 
     def _process_vehicle_telemetry(self, speed: float, distance: float, source: str) -> None:
         """

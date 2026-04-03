@@ -31,6 +31,12 @@ static const unsigned long DISPLAY_UPDATE_INTERVAL_MS = 500UL;
 static unsigned long s_last_sensor_poll_ms = 0;
 static unsigned long s_last_display_ms     = 0;
 
+// When a display command arrives from the RPi, the alert is shown for this
+// duration before falling back to the default local-sensor display.
+static const unsigned long ALERT_DISPLAY_MS = 10000UL;
+static bool          s_display_alert = false;
+static unsigned long s_alert_expire_ms = 0;
+
 // Latest vehicle state, updated every sensor poll and reflected on the display
 static float s_speed    = 0.0f;
 static float s_distance = 0.0f;
@@ -43,6 +49,7 @@ static void forward_hc12_to_rpi(const char *hc12_line);
 static bool extract_json_string(const char *json, const char *key,
                                 char *dst, size_t dstlen);
 static void json_str_escape(char *dst, const char *src, size_t dstlen);
+static float extract_json_number(const char *json, const char *key);
 
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
@@ -75,7 +82,13 @@ void loop() {
     unsigned long now = millis();
     if (now - s_last_display_ms >= DISPLAY_UPDATE_INTERVAL_MS) {
         s_last_display_ms = now;
-        displayVehicleData(s_speed, s_distance, s_safe);
+        // If an RPi-driven alert is active and not expired, skip local refresh.
+        if (s_display_alert && (long)(now - s_alert_expire_ms) < 0) {
+            // Alert still showing — do not overwrite.
+        } else {
+            s_display_alert = false;
+            displayVehicleData(s_speed, s_distance, s_safe);
+        }
     }
 }
 
@@ -139,6 +152,23 @@ static void handle_incoming_message(const SerialMessage &msg) {
         return;
     }
 
+    // ── DISPLAY — RPi-driven P10 alert display ─────────────────────────────
+    // Expected: {"cmd":"display","label":"truck","signal":"STOP",
+    //            "speed":45.2,"priority":"HIGH","emergency":false}
+    if (strstr(msg.raw, "\"cmd\":\"display\"") != nullptr) {
+        char label[32]      = {0};
+        char signal_str[16] = {0};
+        extract_json_string(msg.raw, "label",  label,      sizeof(label));
+        extract_json_string(msg.raw, "signal", signal_str, sizeof(signal_str));
+        float cmd_speed   = extract_json_number(msg.raw, "speed");
+        bool is_emergency = (strstr(msg.raw, "\"emergency\":true") != nullptr);
+
+        displayAlert(label, signal_str, cmd_speed, is_emergency);
+        s_display_alert  = true;
+        s_alert_expire_ms = millis() + ALERT_DISPLAY_MS;
+        return;
+    }
+
     serial_send("{\"type\":\"error\",\"msg\":\"unknown command\"}");
 }
 
@@ -163,6 +193,23 @@ static void poll_and_send_sensor_data(void) {
              "{\"type\":\"vehicle\",\"speed\":%.1f,\"distance\":%.1f}",
              s_speed, s_distance);
     serial_send(payload);
+}
+
+// ─── JSON Numeric Utility ─────────────────────────────────────────────────────
+
+/**
+ * Extract a numeric value for @p key from a raw JSON string.
+ * Looks for the pattern "key": and parses the value with atof().
+ * Returns 0.0 if the key is not found.
+ */
+static float extract_json_number(const char *json, const char *key) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char *p = strstr(json, pattern);
+    if (p == nullptr) return 0.0f;
+    p += strlen(pattern);
+    while (*p == ' ') p++;
+    return static_cast<float>(atof(p));
 }
 
 // ─── JSON String Utilities ────────────────────────────────────────────────────

@@ -144,3 +144,48 @@ void displayVehicleData(float speed, float distance, bool safe) {
         display->print("STP");
     }
 }
+
+// =======================================================================
+// displayAlert – RPi-driven alert layout for 96x16 stock-orientation canvas
+//
+// Row 1 (y=1):  "<label> <speed>km/h"   (white)
+// Row 2 (y=9):  "<signal>"              (colour-coded)
+//
+// Border and signal colour:
+//   emergency / STOP  → red
+//   GO SLOW           → yellow
+//   GO                → green
+// =======================================================================
+void displayAlert(const char *label, const char *signal, float speed, bool emergency) {
+    if (!display) return;
+
+    display->fillScreen(0);
+
+    // Border + signal colour
+    uint16_t accent;
+    if (emergency || strcmp(signal, "STOP") == 0) {
+        accent = dma_display->color565(255, 0, 0);
+    } else if (strcmp(signal, "GO SLOW") == 0) {
+        accent = dma_display->color565(255, 200, 0);
+    } else {
+        accent = dma_display->color565(0, 255, 0);
+    }
+
+    display->drawRect(0, 0, P10_LOGICAL_W, P10_LOGICAL_H, accent);
+
+    // Row 1: label + speed (white)
+    char buf[24];
+    display->setTextSize(1);
+    display->setTextColor(dma_display->color565(255, 255, 255));
+    display->setCursor(2, 1);
+    snprintf(buf, sizeof(buf), "%.8s %.0fkm/h", label, speed);
+    display->print(buf);
+
+    // Row 2: signal (coloured)
+    display->setTextColor(accent);
+    display->setCursor(2, 9);
+    if (emergency) {
+        display->print("!! ");
+    }
+    display->print(signal);
+}
