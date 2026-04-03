@@ -123,7 +123,8 @@ METERS_PER_PIXEL: float = 0.03
 _MIN_TIME_DELTA: float = 0.2
 
 # Minimum linear size change (pixels) to consider vehicle moving (noise floor).
-_MIN_SIZE_CHANGE: float = 2.0
+# Raised from 2.0 to filter YOLO bbox jitter on stationary objects.
+_MIN_SIZE_CHANGE: float = 6.0
 
 # Minimum bounding-box area (pixels²) — filters tiny / noisy detections.
 _MIN_BBOX_AREA: int = 500
@@ -327,7 +328,7 @@ class SmartRoadAlertHost:
                 raw_boxes = results[0].boxes
                 for i in range(len(raw_boxes)):
                     conf = raw_boxes[i].conf.item()
-                    if conf < 0.5:
+                    if conf < 0.55:
                         continue
                     xyxy  = raw_boxes[i].xyxy.cpu().numpy().squeeze().astype(int)
                     xmin, ymin, xmax, ymax = xyxy
@@ -469,6 +470,13 @@ class SmartRoadAlertHost:
                  if now - t["last_seen"] > _TRACK_TIMEOUT_S]
         for tid in stale:
             del self._tracks[tid]
+
+        # Reset speed state of alive-but-unmatched tracks so that if they are
+        # re-matched in a later frame they do not inherit a stale smooth_speed.
+        for tid, track in self._tracks.items():
+            if tid not in matched_track_ids:
+                track["smooth_speed"] = 0.0
+                track["speed_history"] = deque(maxlen=_SPEED_HISTORY_LEN)
 
         # ── 4b. No-vehicle telemetry (rate-limited to once per second) ─────
         if not self._tracks:
@@ -615,10 +623,18 @@ class SmartRoadAlertHost:
         else:
             raw_speed = 0.0
 
-        # EMA smoothing
+        # EMA smoothing.
+        # IMPORTANT: if no movement was measured this frame (raw_speed == 0),
+        # immediately zero the EMA instead of letting it decay slowly.  A
+        # decaying-but-nonzero smooth_speed while no bbox growth is measured
+        # is always a ghost artefact, not a real velocity reading.
         prev = track.get("smooth_speed", 0.0)
-        smooth = (raw_speed if prev == 0.0
-                  else _SPEED_EMA_ALPHA * raw_speed + (1 - _SPEED_EMA_ALPHA) * prev)
+        if raw_speed == 0.0:
+            smooth = 0.0
+        elif prev == 0.0:
+            smooth = raw_speed
+        else:
+            smooth = _SPEED_EMA_ALPHA * raw_speed + (1 - _SPEED_EMA_ALPHA) * prev
         track["smooth_speed"] = smooth
 
         # Speed history for acceleration / variance
