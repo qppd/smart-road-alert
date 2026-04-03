@@ -492,6 +492,11 @@ class SmartRoadAlertHost:
         best_alert_rank = -1
 
         for tid, track in self._tracks.items():
+            # Skip tracks not matched this frame — avoids ghost speed/distance
+            # values being emitted when YOLO misses a detection.
+            if tid not in matched_track_ids:
+                continue
+
             bbox  = track["bbox"]
             label = track["label"]
             conf  = track["confidence"]
