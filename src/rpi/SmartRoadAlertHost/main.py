@@ -218,6 +218,16 @@ class SmartRoadAlertHost:
         self._overlay_data: list = []  # per-frame overlay items for camera drawing
         self._current_alert: dict = {} # highest-priority alert currently displayed
         self._last_empty_sent: float = 0.0  # cooldown for no-vehicle telemetry
+        # ── Telemetry overlay state (written by camera thread, read by main thread) ──
+        self._last_telemetry: dict = {
+            "label":     "none",
+            "speed":     0.0,
+            "distance":  0.0,
+            "direction": "none",
+            "priority":  "LOW",
+            "emergency": False,
+            "last_seen": 0.0,
+        }
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -462,6 +472,13 @@ class SmartRoadAlertHost:
 
         # ── 4b. No-vehicle telemetry (rate-limited to once per second) ─────
         if not self._tracks:
+            # Auto-reset display telemetry after 5 s of no detection
+            if now - self._last_telemetry["last_seen"] > 5.0:
+                self._last_telemetry.update({
+                    "label": "none", "speed": 0.0,
+                    "distance": 0.0, "direction": "none",
+                    "priority": "LOW", "emergency": False,
+                })
             if now - self._last_empty_sent >= 1.0:
                 self._last_empty_sent = now
                 empty_payload = {
@@ -538,6 +555,24 @@ class SmartRoadAlertHost:
                     "speed": speed_kmh, "priority": priority,
                     "emergency": emergency_active,
                 }
+
+            # ── Update display telemetry (highest-priority / fastest track) ──
+            t_rank = (4 if emergency_active else
+                      3 if priority == "HIGH" else
+                      2 if priority == "MEDIUM" else 1)
+            cur_rank = (4 if self._last_telemetry["emergency"] else
+                        3 if self._last_telemetry["priority"] == "HIGH" else
+                        2 if self._last_telemetry["priority"] == "MEDIUM" else 1)
+            if direction == "incoming" and t_rank >= cur_rank:
+                self._last_telemetry.update({
+                    "label":     label,
+                    "speed":     speed_kmh,
+                    "distance":  distance,
+                    "direction": direction,
+                    "priority":  priority,
+                    "emergency": emergency_active,
+                    "last_seen": now,
+                })
 
             # ── Telemetry (rate-limited per track) ──
             if now - track["last_sent"] < _SEND_INTERVAL_S:
@@ -754,6 +789,33 @@ class SmartRoadAlertHost:
                 if frame is not None:
                     frame_display = cv2.resize(
                         frame, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+
+                    # ── Telemetry overlay ──────────────────────────────────
+                    tel = self._last_telemetry
+                    em  = tel["emergency"]
+                    col = (0, 0, 255) if em else (0, 255, 255)
+                    cv2.rectangle(frame_display, (5, 5), (440, 160),
+                                  (0, 0, 0), cv2.FILLED)
+                    cv2.rectangle(frame_display, (5, 5), (440, 160),
+                                  col, 1)
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    lbl_text = tel["label"]
+                    if em:
+                        lbl_text = "!! " + lbl_text + " EMERGENCY"
+                    cv2.putText(frame_display,
+                                f"Label   : {lbl_text}",
+                                (12, 35), font, 0.75, col, 2)
+                    cv2.putText(frame_display,
+                                f"Speed   : {tel['speed']:.1f} km/h",
+                                (12, 70), font, 0.75, col, 2)
+                    cv2.putText(frame_display,
+                                f"Distance: {tel['distance']:.1f} m",
+                                (12, 105), font, 0.75, col, 2)
+                    cv2.putText(frame_display,
+                                f"Direction: {tel['direction']}",
+                                (12, 140), font, 0.75, col, 2)
+                    # ──────────────────────────────────────────────────────
+
                     cv2.imshow("Smart Road Alert — YOLO", frame_display)
                 key = cv2.waitKey(30)
                 if key == ord('q'):
