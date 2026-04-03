@@ -472,13 +472,6 @@ class SmartRoadAlertHost:
 
         # ── 4b. No-vehicle telemetry (rate-limited to once per second) ─────
         if not self._tracks:
-            # Auto-reset display telemetry after 5 s of no detection
-            if now - self._last_telemetry["last_seen"] > 5.0:
-                self._last_telemetry.update({
-                    "label": "none", "speed": 0.0,
-                    "distance": 0.0, "direction": "none",
-                    "priority": "LOW", "emergency": False,
-                })
             if now - self._last_empty_sent >= 1.0:
                 self._last_empty_sent = now
                 empty_payload = {
@@ -555,24 +548,6 @@ class SmartRoadAlertHost:
                     "speed": speed_kmh, "priority": priority,
                     "emergency": emergency_active,
                 }
-
-            # ── Update display telemetry (highest-priority / fastest track) ──
-            t_rank = (4 if emergency_active else
-                      3 if priority == "HIGH" else
-                      2 if priority == "MEDIUM" else 1)
-            cur_rank = (4 if self._last_telemetry["emergency"] else
-                        3 if self._last_telemetry["priority"] == "HIGH" else
-                        2 if self._last_telemetry["priority"] == "MEDIUM" else 1)
-            if direction == "incoming" and t_rank >= cur_rank:
-                self._last_telemetry.update({
-                    "label":     label,
-                    "speed":     speed_kmh,
-                    "distance":  distance,
-                    "direction": direction,
-                    "priority":  priority,
-                    "emergency": emergency_active,
-                    "last_seen": now,
-                })
 
             # ── Telemetry (rate-limited per track) ──
             if now - track["last_sent"] < _SEND_INTERVAL_S:
@@ -790,7 +765,14 @@ class SmartRoadAlertHost:
                     frame_display = cv2.resize(
                         frame, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
 
-                    # ── Telemetry overlay ──────────────────────────────────
+                    # ── Telemetry overlay (data received from remote via HC-12) ──
+                    # Auto-reset HUD after 5 s of no HC-12 receive
+                    if time.time() - self._last_telemetry["last_seen"] > 5.0:
+                        self._last_telemetry.update({
+                            "label": "none", "speed": 0.0,
+                            "distance": 0.0, "direction": "none",
+                            "priority": "LOW", "emergency": False,
+                        })
                     tel = self._last_telemetry
                     em  = tel["emergency"]
                     col = (0, 0, 255) if em else (0, 255, 255)
@@ -951,6 +933,17 @@ class SmartRoadAlertHost:
             "TELEMETRY → %-12s | %5.1f km/h | %-8s | dist=%5.1fm | pri=%-6s | em=%s | source=%s",
             label, speed, direction, distance, priority, emergency, node,
         )
+
+        # ── Update HUD overlay with received HC-12 data ──
+        self._last_telemetry.update({
+            "label":     label,
+            "speed":     speed,
+            "distance":  distance,
+            "direction": direction,
+            "priority":  priority,
+            "emergency": emergency,
+            "last_seen": time.time(),
+        })
 
         # Sender's "outgoing" means vehicle is heading TOWARD us.
         local_direction = "incoming" if direction == "outgoing" else "outgoing"
