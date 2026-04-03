@@ -1,7 +1,8 @@
+
 /*************************************************************************
-   Quarter-scan HUB75 panel example for ESP32
-   Smooth red-fill animation across the panel without quadrant jumps
-*************************************************************************/
+  Quarter-scan HUB75 panel example for ESP32
+  Smooth red-fill animation across the panel without quadrant jumps
+/*************************************************************************/
 
 #include "ESP32-VirtualMatrixPanel-I2S-DMA.h"
 
@@ -22,45 +23,44 @@ inline VirtualCoords CustomPxBasePanel::getCoords(int16_t x, int16_t y) {
 
     uint8_t pxbase = panelResX;
 
-    if (panelResY == 32) { // 32px high panel
-        if ((coords.y & 8) == 0)
-            coords.x += ((coords.x / pxbase) + 1) * pxbase;
-        else
-            coords.x += (coords.x / pxbase) * pxbase;
-        coords.y = (coords.y >> 4) * 8 + (coords.y & 0b00000111);
+  // mapper for panels with any other heights
+  else {
+    uint8_t half_height = panelResY / 2;
+   
+    if ((coords.y  % half_height ) < half_height/2)
+    {
+     coords.x += (coords.x / pxbase + 1) * pxbase;
     }
-    else if (panelResY == 16) { // 16px high panel
-        if ((coords.y & 4) == 0)
-            coords.x += ((coords.x / pxbase) + 1) * pxbase;
-        else
-            coords.x += (coords.x / pxbase) * pxbase;
-        coords.y = (coords.y >> 3) * 4 + (coords.y & 0b00000011);
-    }
-    else { // other heights
-        uint8_t half_height = panelResY / 2;
-        if ((coords.y % half_height) < half_height / 2)
-            coords.x += (coords.x / pxbase + 1) * pxbase;
-        else
-            coords.x += (coords.x / pxbase) * pxbase;
+    else
+    {
+     coords.x += (coords.x / pxbase) * pxbase; // 2nd, 4th 'block' of 8 rows of pixels, offset by panel width in DMA buffer
+     }
+     
+     coords.y = (coords.y / half_height ) * (half_height/2) + (coords.y % (half_height/2));
 
-        coords.y = (coords.y / half_height) * (half_height / 2) + (coords.y % (half_height / 2));
-    }
-
-    return coords;
+  }
+  return coords;
 }
 
 // Panel configuration
-#define PANEL_RES_X 32
-#define PANEL_RES_Y 16
+#define PANEL_RES_X 32 // Number of pixels wide of each INDIVIDUAL panel module. 
+#define PANEL_RES_Y 16 // Number of pixels tall of each INDIVIDUAL panel module.
 
-#define NUM_ROWS 1
-#define NUM_COLS 1
+// Use a single panel for tests
+#define NUM_ROWS 1 // Number of rows of chained INDIVIDUAL PANELS
+#define NUM_COLS 1 // Number of INDIVIDUAL PANELS per ROW
 
+// Chain settings, do not cnahge
 #define SERPENT true
 #define TOPDOWN false
-#define VIRTUAL_MATRIX_CHAIN_TYPE CHAIN_TOP_LEFT_DOWN_ZZ
+#define VIRTUAL_MATRIX_CHAIN_TYPE CHAIN_BOTTOM_RIGHT_UP
 
-// Pins
+// placeholder for the matrix object
+MatrixPanel_I2S_DMA *dma_display = nullptr;
+
+// placeholder for the virtual display object
+CustomPxBasePanel   *FourScanPanel = nullptr;
+
 #define R1_PIN 4
 #define G1_PIN 5
 #define B1_PIN 15
@@ -76,56 +76,58 @@ inline VirtualCoords CustomPxBasePanel::getCoords(int16_t x, int16_t y) {
 #define OE_PIN 13
 #define CLK_PIN 21
 
-// Matrix objects
-MatrixPanel_I2S_DMA *dma_display = nullptr;
-CustomPxBasePanel *FourScanPanel = nullptr;
-
-void setup() {
-    Serial.begin(115200);
-
-    HUB75_I2S_CFG::i2s_pins _pins = { R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN,
-                                      A_PIN, B_PIN, C_PIN, D_PIN, E_PIN, LAT_PIN, OE_PIN, CLK_PIN };
-
-    HUB75_I2S_CFG mxconfig(
-        PANEL_RES_X * 2,      // DMA width (half-scan)
-        PANEL_RES_Y / 2,      // DMA height (half-scan)
-        NUM_ROWS * NUM_COLS,
-        _pins
-    );
-
-    mxconfig.clkphase = false;         // adjust if columns shifted
-    mxconfig.driver = HUB75_I2S_CFG::MBI5124; // driver type
-
-    // Create DMA display object
-    dma_display = new MatrixPanel_I2S_DMA(mxconfig);
-    dma_display->setBrightness8(192); // ~75% brightness
-
-    if (!dma_display->begin()) {
-        Serial.println("****** !KABOOM! I2S memory allocation failed ***********");
-        while (1);
-    }
-
-    dma_display->clearScreen();
-    delay(500);
-
-    // Create virtual panel object
-    FourScanPanel = new CustomPxBasePanel(*dma_display, NUM_ROWS, NUM_COLS,
-                                          PANEL_RES_X, PANEL_RES_Y,
-                                          VIRTUAL_MATRIX_CHAIN_TYPE);
-    //FourScanPanel->setPhysicalPanelScanRate(FOUR_SCAN_16PX_HIGH);
-}
-void loop() {
-
- for (int i = FourScanPanel->height() - 1; i >= 0; i--)
+/******************************************************************************
+   Setup!
+ ******************************************************************************/
+void setup()
 {
-  for (int j = FourScanPanel->width() - 1; j >= 0; j--)
-  {
-    FourScanPanel->drawPixel(j, i, FourScanPanel->color565(255, 0, 0));
-    delay(30);
-  }
+  HUB75_I2S_CFG::i2s_pins _pins={R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN, A_PIN, B_PIN, C_PIN, D_PIN, E_PIN, LAT_PIN, OE_PIN, CLK_PIN};
+  HUB75_I2S_CFG mxconfig(
+    PANEL_RES_X * 2,            // DO NOT CHANGE THIS
+    PANEL_RES_Y / 2,            // DO NOT CHANGE THIS
+    NUM_ROWS * NUM_COLS         // DO NOT CHANGE THIS
+    ,_pins            // Uncomment to enable custom pins
+  );
+
+  // Change this if you see pixels showing up shifted wrongly by one column the left or right.
+  mxconfig.clkphase = false; 
+  
+  // Uncomment this to use a TYPE595 decoder like DP32020/SM5368/TC75xx
+  //mxconfig.line_decoder = HUB75_I2S_CFG::TYPE595;
+
+  // Driver
+  mxconfig.driver = HUB75_I2S_CFG::MBI5124;
+
+  // OK, now we can create our matrix object
+  dma_display = new MatrixPanel_I2S_DMA(mxconfig);
+
+  // let's adjust default brightness to about 75%
+  dma_display->setBrightness8(1);    // range is 0-255, 0 - 0%, 255 - 100%
+
+  // Allocate memory and start DMA display
+  if ( not dma_display->begin() )
+    Serial.println("****** !KABOOM! I2S memory allocation failed ***********");
+
+
+  dma_display->clearScreen();
+  delay(500);
+
+  // create FourScanPanellay object based on our newly created dma_display object
+  FourScanPanel = new CustomPxBasePanel ((*dma_display), NUM_ROWS, NUM_COLS, PANEL_RES_X, PANEL_RES_Y,  VIRTUAL_MATRIX_CHAIN_TYPE);
+
 }
 
+
+void loop() {
+  for (int i = 0; i < FourScanPanel->height(); i++)
+  {
+    for (int j = 0; j < FourScanPanel->width(); j++)
+    {
+      FourScanPanel->drawPixel(j, i, FourScanPanel->color565(255, 0, 0));
+      delay(5);
+    }
+  }
   delay(2000);
   dma_display->clearScreen();
-
 } // end loop
+

@@ -1,0 +1,35 @@
+description: Ultralytics best model trained on /kaggle/input/datasets/group17trainer/thesis-v3-results/data.yaml
+author: Ultralytics
+date: '2026-03-24T11:05:54.545264'
+version: 8.4.24
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: ambulance
+  1: bicycle
+  2: bus
+  3: car
+  4: ev_large
+  5: ev_small
+  6: fire_truck
+  7: jeepney
+  8: kalesa
+  9: kariton
+  10: motorcycle
+  11: pedicab
+  12: police_car
+  13: tricycle
+  14: truck
+  15: tuktuk
+  16: van
+args:
+  batch: 1
+  half: false
+channels: 3
+end2end: false
