@@ -478,19 +478,24 @@ class SmartRoadAlertHost:
                 track["smooth_speed"] = 0.0
                 track["speed_history"] = deque(maxlen=_SPEED_HISTORY_LEN)
 
-        # ── 4b. No-vehicle telemetry (rate-limited to once per second) ─────
-        if not self._tracks:
+        # ── 4b. No-detection telemetry (rate-limited to once per second) ──
+        # Triggered as soon as NO detection matches this frame — do NOT wait
+        # for the 2-second track-prune timeout.  Without this, the remote HUD
+        # would keep showing a stale speed for up to 2 extra seconds after the
+        # vehicle leaves YOLO's detection window.
+        if not matched_track_ids:
             if now - self._last_empty_sent >= 1.0:
                 self._last_empty_sent = now
                 empty_payload = {
                     "type":      "vehicle",
+                    "label":     "none",
                     "speed":     0.0,
                     "distance":  0.0,
                     "direction": "none",
                     "node":      NODE_ID,
                 }
                 self.send_via_hc12(empty_payload)
-                logger.info("TELEMETRY → no vehicle | speed=0.0 km/h | distance=0.0 m")
+                logger.debug("TELEMETRY → no vehicle | speed=0.0 km/h | distance=0.0 m")
             self._overlay_data = []
             return
 
@@ -949,6 +954,23 @@ class SmartRoadAlertHost:
 
         speed    = float(speed)
         distance = float(distance) if distance is not None else 0.0
+
+        # ── No-vehicle reset packet: speed==0 && direction=="none" ──────────
+        # The remote RPi sends this every second when its YOLO has no
+        # detections.  Reset the HUD immediately and return — no alert logic
+        # or display command needed.
+        if speed == 0.0 and direction in ("none", "unknown") and not emergency:
+            self._last_telemetry.update({
+                "label":     "none",
+                "speed":     0.0,
+                "distance":  0.0,
+                "direction": "none",
+                "priority":  "LOW",
+                "emergency": False,
+                "last_seen": time.time(),
+            })
+            logger.debug("REMOTE → no vehicle | source=%s", node)
+            return
 
         logger.info(
             "TELEMETRY → %-12s | %5.1f km/h | %-8s | dist=%5.1fm | pri=%-6s | em=%s | source=%s",
