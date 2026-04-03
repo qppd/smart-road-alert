@@ -328,7 +328,7 @@ class SmartRoadAlertHost:
                 raw_boxes = results[0].boxes
                 for i in range(len(raw_boxes)):
                     conf = raw_boxes[i].conf.item()
-                    if conf < 0.8:
+                    if conf < 0.6:
                         continue
                     xyxy  = raw_boxes[i].xyxy.cpu().numpy().squeeze().astype(int)
                     xmin, ymin, xmax, ymax = xyxy
