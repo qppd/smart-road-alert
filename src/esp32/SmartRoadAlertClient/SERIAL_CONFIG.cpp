@@ -33,8 +33,6 @@ void serial_init(void) {
     s_handshake_ts_ms   = millis();
     s_last_heartbeat_ms = millis();
     s_last_host_rx_ms   = millis();
-
-    Serial.println(F("[SERIAL] Initialised — awaiting HELLO from host."));
 }
 
 void serial_update(void) {
@@ -59,7 +57,7 @@ void serial_update(void) {
             } else {
             
                 s_rx_idx = 0;
-                Serial.println(F("[SERIAL] WARN: RX buffer overflow — frame discarded."));
+                /* RX buffer overflow: frame discarded */
             }
         }
     }
@@ -118,7 +116,6 @@ static void _dispatch_line(const char *line) {
          */
 
         if (strcmp(line, HANDSHAKE_HELLO) == 0) {
-            Serial.println(F("[SERIAL] Re-handshake requested by host."));
             _on_handshake_hello();
             return;
         }
@@ -134,16 +131,14 @@ static void _on_handshake_hello(void) {
     Serial.println(HANDSHAKE_READY);   
     s_state             = SERIAL_CONNECTED;
     s_last_heartbeat_ms = millis();
-    s_last_host_rx_ms   = millis();   /* reset silence timer on new connection */
-    Serial.println(F("[SERIAL] Handshake complete — connected."));
+    s_last_host_rx_ms   = millis();
 }
 
 static void _tick_handshake(void) {
     unsigned long now = millis();
     if (now - s_handshake_ts_ms >= HANDSHAKE_TIMEOUT_MS) {
         s_handshake_ts_ms = now;
-        s_rx_idx = 0;   
-        Serial.println(F("[SERIAL] Awaiting HELLO from host..."));
+        s_rx_idx = 0;
     }
 }
 
@@ -163,7 +158,6 @@ static void _tick_connected(void) {
         s_state           = SERIAL_WAITING_HANDSHAKE;
         s_handshake_ts_ms = now;
         s_rx_idx          = 0;
-        Serial.println(F("[SERIAL] Host silent — reset to WAITING_HANDSHAKE."));
     }
 #endif
 }

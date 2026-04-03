@@ -217,6 +217,7 @@ class SmartRoadAlertHost:
         self._next_track_id: int = 0
         self._overlay_data: list = []  # per-frame overlay items for camera drawing
         self._current_alert: dict = {} # highest-priority alert currently displayed
+        self._last_empty_sent: float = 0.0  # cooldown for no-vehicle telemetry
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -459,6 +460,22 @@ class SmartRoadAlertHost:
         for tid in stale:
             del self._tracks[tid]
 
+        # ── 4b. No-vehicle telemetry (rate-limited to once per second) ─────
+        if not self._tracks:
+            if now - self._last_empty_sent >= 1.0:
+                self._last_empty_sent = now
+                empty_payload = {
+                    "type":      "vehicle",
+                    "speed":     0.0,
+                    "distance":  0.0,
+                    "direction": "none",
+                    "node":      NODE_ID,
+                }
+                self.send_via_hc12(empty_payload)
+                logger.info("TELEMETRY → no vehicle | speed=0.0 km/h | distance=0.0 m")
+            self._overlay_data = []
+            return
+
         # ── 5. Compute kinematics, build overlays, emit telemetry ──────────
         self._overlay_data = []
         best_alert: Optional[dict] = None
@@ -542,8 +559,8 @@ class SmartRoadAlertHost:
             }
 
             logger.info(
-                "Track[%d] %s dir=%s spd=%.1f dst=%.1fm pri=%s em=%s sig=%s",
-                tid, label, direction, speed_kmh, distance,
+                "TELEMETRY → %-12s | %5.1f km/h | %-8s | dist=%5.1fm | pri=%-6s | em=%s | sig=%s",
+                label, speed_kmh, direction, distance,
                 priority, emergency_active, signal,
             )
             if emergency_active and direction == "incoming":
@@ -708,18 +725,18 @@ class SmartRoadAlertHost:
                 if now - self._t_last_ping >= PING_INTERVAL_S:
                     self._t_last_ping = now
                     self._serial.send('{"cmd":"ping"}')
-                    logger.info("Sent PING to ESP32.")
+                    logger.debug("Sent PING to ESP32.")
 
                 if now - self._t_last_status >= STATUS_INTERVAL_S:
                     self._t_last_status = now
                     self._serial.send('{"cmd":"status"}')
-                    logger.info("Sent STATUS request to ESP32.")
+                    logger.debug("Sent STATUS request to ESP32.")
 
                 # ── HC-12 heartbeat ping to remote RPi ──────────────────────
                 if now - self._t_last_hc12_ping >= HC12_PING_INTERVAL_S:
                     self._t_last_hc12_ping = now
                     self.send_via_hc12({"type": "RPI_PING", "node": NODE_ID})
-                    logger.info("Sent RPI_PING via HC-12 (node=%s).", NODE_ID)
+                    logger.debug("Sent RPI_PING via HC-12 (node=%s).", NODE_ID)
 
             # ── Display latest camera frame on the main thread (GUI calls must
             #    not run from a daemon thread — black frames are a threading issue)
@@ -735,7 +752,9 @@ class SmartRoadAlertHost:
 
 
                 if frame is not None:
-                    cv2.imshow("Smart Road Alert — YOLO", frame)
+                    frame_display = cv2.resize(
+                        frame, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+                    cv2.imshow("Smart Road Alert — YOLO", frame_display)
                 key = cv2.waitKey(30)
                 if key == ord('q'):
                     self._camera_running = False
@@ -763,11 +782,11 @@ class SmartRoadAlertHost:
             self._on_local_vehicle_data(data)
 
         elif msg_type == "pong":
-            logger.info("ESP32 PONG received.")
+            logger.debug("ESP32 PONG received.")
 
         elif msg_type == "status":
             state = data.get("state", "unknown")
-            logger.info("ESP32 status: %s", state)
+            logger.debug("ESP32 status: %s", state)
 
         elif msg_type == "heartbeat":
             logger.debug("ESP32 heartbeat received.")
@@ -805,8 +824,8 @@ class SmartRoadAlertHost:
         distance = float(distance)
 
         logger.info(
-            "Local vehicle telemetry (ESP32) — speed: %.1f km/h, distance: %.1f m",
-            speed, distance,
+            "TELEMETRY → %-12s | %5.1f km/h | dist=%5.1fm | source=esp32",
+            "esp32_sensor", speed, distance,
         )
 
         # ── Apply alert thresholds locally ──
@@ -867,8 +886,8 @@ class SmartRoadAlertHost:
         distance = float(distance) if distance is not None else 0.0
 
         logger.info(
-            "Remote vehicle (from %s): %s dir=%s spd=%.1f km/h dst=%.1fm pri=%s em=%s",
-            node, label, direction, speed, distance, priority, emergency,
+            "TELEMETRY → %-12s | %5.1f km/h | %-8s | dist=%5.1fm | pri=%-6s | em=%s | source=%s",
+            label, speed, direction, distance, priority, emergency, node,
         )
 
         # Sender's "outgoing" means vehicle is heading TOWARD us.
@@ -955,22 +974,22 @@ class SmartRoadAlertHost:
 
         elif msg_type == "RPI_PING":
             remote_node = data.get("node", "unknown")
-            logger.info("HC-12 RPI_PING from %s — sending PONG.", remote_node)
+            logger.debug("HC-12 RPI_PING from %s — sending PONG.", remote_node)
             self.send_via_hc12({"type": "RPI_PONG", "node": NODE_ID})
 
         elif msg_type == "RPI_PONG":
             remote_node = data.get("node", "unknown")
-            logger.info("HC-12 RPI_PONG received from %s.", remote_node)
+            logger.debug("HC-12 RPI_PONG received from %s.", remote_node)
 
         elif msg_type == "ack":
-            logger.info("HC-12 ACK from remote RPi: %s", data.get("msg", ""))
+            logger.debug("HC-12 ACK from remote RPi: %s", data.get("msg", ""))
 
         elif msg_type == "alert":
             logger.warning("HC-12 ALERT from remote RPi: %s", data.get("msg", "(no detail)"))
 
         elif msg_type == "status":
             status = data.get("status", "(no detail)")
-            logger.info("HC-12 status from remote RPi: %s", status)
+            logger.debug("HC-12 status from remote RPi: %s", status)
 
         else:
             logger.warning("HC-12: unknown message type %r: %s", msg_type, raw)

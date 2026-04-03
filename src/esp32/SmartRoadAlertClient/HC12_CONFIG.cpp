@@ -41,42 +41,28 @@ void hc12_init(void) {
     delay(AT_ASSERT_MS);
 
     bool ok = _at_cmd("AT", "OK");
-    if (!ok) {
-        Serial.println(F("[HC12] AT handshake failed — module using factory defaults."));
-    } else {
+    if (ok) {
         char cmd[16];
 
         // Set UART baud rate (matches HC12_BAUD)
         snprintf(cmd, sizeof(cmd), "AT+B%d", HC12_BAUD);
-        if (!_at_cmd(cmd, "OK+B")) {
-            Serial.println(F("[HC12] WARN: AT+Bxxxx not acknowledged."));
-        }
+        _at_cmd(cmd, "OK+B");
 
         // Set channel (3-digit, zero-padded)
         snprintf(cmd, sizeof(cmd), "AT+C%03d", HC12_CHANNEL);
-        if (!_at_cmd(cmd, "OK+C")) {
-            Serial.println(F("[HC12] WARN: AT+Cxxx not acknowledged."));
-        }
+        _at_cmd(cmd, "OK+C");
 
         // Set operating mode FU3 (normal-speed, full-function)
-        if (!_at_cmd("AT+FU3", "OK+FU3")) {
-            Serial.println(F("[HC12] WARN: AT+FU3 not acknowledged."));
-        }
+        _at_cmd("AT+FU3", "OK+FU3");
 
         // Set transmit power level
         snprintf(cmd, sizeof(cmd), "AT+P%d", HC12_POWER);
-        if (!_at_cmd(cmd, "OK+P")) {
-            Serial.println(F("[HC12] WARN: AT+Px not acknowledged."));
-        }
-
-        Serial.println(F("[HC12] Configuration applied."));
+        _at_cmd(cmd, "OK+P");
     }
 
     // ── Return to transparent mode ────────────────────────────────────────
     digitalWrite(PIN_HC12_SET, HIGH);
     delay(AT_RELEASE_MS);
-
-    Serial.println(F("[HC12] Ready."));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,7 +90,7 @@ void hc12_update(void) {
             } else {
                 // Buffer overflow — discard the partial frame and reset
                 s_rx_idx = 0;
-                Serial.println(F("[HC12] WARN: RX buffer overflow — frame discarded."));
+                /* RX buffer overflow: frame discarded */
             }
         }
     }
