@@ -426,12 +426,10 @@ class DashboardGUI:
 
     def update_status(self, signal_text: str, emergency: bool = False) -> None:
         """Update the central status indicator with animation."""
-        if emergency:
-            new_status, new_color = "EMERGENCY", self._RED
-        elif signal_text == "STOP":
+        if emergency or signal_text == "STOP":
             new_status, new_color = "STOP", self._RED
         elif signal_text in ("GO SLOW", "SLOW"):
-            new_status, new_color = "CAUTION", self._YELLOW
+            new_status, new_color = "SLOW", self._YELLOW
         else:
             new_status, new_color = "GO", self._GREEN
 
@@ -448,10 +446,10 @@ class DashboardGUI:
         # Kick off cross-fade from current label to new label
         self._animate_status_change(new_status, new_color)
 
-        # Start continuous pulse for STOP / EMERGENCY / CAUTION
-        if new_status in ("STOP", "EMERGENCY"):
+        # Start continuous pulse for STOP / SLOW
+        if new_status == "STOP":
             self._start_pulse(new_color, strong=True)
-        elif new_status == "CAUTION":
+        elif new_status == "SLOW":
             self._start_pulse(new_color, strong=False)
 
     def update_vehicle_info(self, label: str, speed: float,
@@ -1330,9 +1328,8 @@ class SmartRoadAlertHost:
                 self._t_last_hc12_ping = now
                 self.send_via_hc12({"type": "RPI_PING", "node": NODE_ID})
 
-        # ── Update GUI from display dicts ──
+        # ── Update GUI from REMOTE telemetry ONLY ──
         with self._display_lock:
-            ld = dict(self._local_display)
             rd = dict(self._remote_display)
 
         # Auto-reset remote display after 5 s of no HC-12 data
@@ -1340,23 +1337,19 @@ class SmartRoadAlertHost:
             rd = {"label": "none", "speed": 0.0, "direction": "NONE",
                   "signal": "GO", "emergency": False}
 
-        # Determine highest signal for status bar
-        if ld["emergency"] or rd["emergency"]:
+        # Determine status from remote telemetry only (GO / SLOW / STOP)
+        if rd["emergency"]:
             self._gui.update_status("STOP", emergency=True)
-        elif ld["signal"] == "STOP" or rd["signal"] == "STOP":
+        elif rd["signal"] == "STOP":
             self._gui.update_status("STOP")
-        elif ld["signal"] in ("GO SLOW", "SLOW") or rd["signal"] in ("GO SLOW", "SLOW"):
+        elif rd["signal"] in ("GO SLOW", "SLOW"):
             self._gui.update_status("SLOW")
         else:
             self._gui.update_status("GO")
 
-        # Show the highest-priority source's vehicle info (unified display)
-        _rank = {"GO": 0, "GO SLOW": 1, "SLOW": 1, "STOP": 2}
-        l_rank = 3 if ld["emergency"] else _rank.get(ld["signal"], 0)
-        r_rank = 3 if rd["emergency"] else _rank.get(rd["signal"], 0)
-        best = ld if l_rank >= r_rank else rd
+        # Show remote vehicle info only
         self._gui.update_vehicle_info(
-            best["label"], best["speed"], best["direction"])
+            rd["label"], rd["speed"], rd["direction"])
 
         self._gui.root.after(50, self._gui_poll)
 
