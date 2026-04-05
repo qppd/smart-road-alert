@@ -283,23 +283,34 @@ class TTSManager:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DashboardGUI — CustomTkinter outdoor-readable display
+# DashboardGUI — Fullscreen roadside traffic display
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DashboardGUI:
-    """CustomTkinter outdoor-readable dashboard.
+    """Fullscreen, animated traffic display built with CustomTkinter.
 
-    Designed for roadside visibility: large fonts, high-contrast dark
-    background, and color-coded status (GO green, SLOW yellow, STOP red).
+    Design goals:
+    - Looks like a real-world intelligent roadside LCD sign.
+    - Massive colour-coded status dominates the screen (GO / SLOW / STOP).
+    - Vehicle info shown below in large, high-contrast text.
+    - Responsive: all sizes derived from screen dimensions, not fixed px.
+    - Smooth pulse/fade animations driven by after() — never blocking.
     """
 
-    _GREEN  = "#00CC44"
+    # ── Colour palette ──
+    _GREEN  = "#00E050"
     _YELLOW = "#FFB800"
     _RED    = "#FF2222"
-    _BG     = "#0D1117"
+    _BG     = "#08090C"
     _FG     = "#E6EDF3"
-    _DIM    = "#7D8590"
-    _PANEL  = "#161B22"
+    _DIM    = "#555E6A"
+    _PANEL  = "#11151C"
+    _BORDER = "#1C2333"
+
+    # ── Animation parameters ──
+    _PULSE_INTERVAL_MS = 60
+    _PULSE_STEPS       = 18       # half-cycle frames (bright→dim)
+    _FADE_STEPS        = 10
 
     def __init__(self) -> None:
         ctk.set_appearance_mode("dark")
@@ -307,105 +318,245 @@ class DashboardGUI:
 
         self.root = ctk.CTk()
         self.root.title("Smart Road Alert")
-        self.root.geometry("800x600")
         self.root.configure(fg_color=self._BG)
+
+        # ── Fullscreen, borderless, always-on-top ──
+        self.root.attributes("-fullscreen", True)
+        try:
+            self.root.attributes("-topmost", True)
+        except Exception:
+            pass
+        self.root.bind("<Escape>", lambda _e: self.root.attributes(
+            "-fullscreen", False))
         self.root.bind("<F11>", lambda _e: self.root.attributes(
-            "-fullscreen", not self.root.attributes("-fullscreen")))
+            "-fullscreen",
+            not self.root.attributes("-fullscreen")))
 
-        # ── Title ──
-        ctk.CTkLabel(
-            self.root, text="SMART ROAD ALERT",
-            font=ctk.CTkFont(size=30, weight="bold"),
-            text_color=self._FG,
-        ).pack(pady=(15, 5))
+        # ── Derive sizes from screen resolution ──
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        self._s = min(sw, sh)                  # reference dimension
+        self._status_font_size = max(int(self._s * 0.18), 72)
+        self._vehicle_font_size = max(int(self._s * 0.055), 28)
+        self._info_font_size = max(int(self._s * 0.04), 22)
+        self._header_font_size = max(int(self._s * 0.022), 14)
+        self._pad = max(int(self._s * 0.02), 10)
 
-        # ── Status indicator ──
+        # ── Root grid: status top (weight 5), info bottom (weight 2) ──
+        self.root.grid_rowconfigure(0, weight=5)
+        self.root.grid_rowconfigure(1, weight=0)    # separator
+        self.root.grid_rowconfigure(2, weight=2)
+        self.root.grid_columnconfigure(0, weight=1)
+
+        # ══════════════════════════════════════════════════════════════════
+        # STATUS ZONE — dominates ~65 % of screen
+        # ══════════════════════════════════════════════════════════════════
         self._status_frame = ctk.CTkFrame(
-            self.root, corner_radius=18, fg_color=self._GREEN, height=130)
-        self._status_frame.pack(fill="x", padx=25, pady=10)
-        self._status_frame.pack_propagate(False)
+            self.root, fg_color=self._BG, corner_radius=0)
+        self._status_frame.grid(row=0, column=0, sticky="nsew")
+        self._status_frame.grid_rowconfigure(0, weight=1)
+        self._status_frame.grid_columnconfigure(0, weight=1)
+
         self._status_label = ctk.CTkLabel(
             self._status_frame, text="GO",
-            font=ctk.CTkFont(size=64, weight="bold"),
-            text_color="#000000")
-        self._status_label.pack(expand=True)
+            font=ctk.CTkFont(size=self._status_font_size, weight="bold"),
+            text_color=self._GREEN)
+        self._status_label.grid(row=0, column=0, sticky="nsew")
 
-        # ── Info panels container ──
-        info = ctk.CTkFrame(self.root, fg_color="transparent")
-        info.pack(fill="both", expand=True, padx=25, pady=5)
-        info.grid_columnconfigure(0, weight=1)
-        info.grid_columnconfigure(1, weight=1)
+        # ── Thin horizontal divider ──
+        ctk.CTkFrame(
+            self.root, fg_color=self._BORDER, height=2, corner_radius=0
+        ).grid(row=1, column=0, sticky="ew")
 
-        # ── Local detection panel ──
-        lf = ctk.CTkFrame(info, corner_radius=12, fg_color=self._PANEL)
-        lf.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=5)
-        ctk.CTkLabel(lf, text="LOCAL DETECTION",
-                     font=ctk.CTkFont(size=16, weight="bold"),
-                     text_color=self._DIM).pack(anchor="w", padx=18, pady=(12, 4))
+        # ══════════════════════════════════════════════════════════════════
+        # INFO ZONE — vehicle type, speed, direction
+        # ══════════════════════════════════════════════════════════════════
+        info_frame = ctk.CTkFrame(
+            self.root, fg_color=self._PANEL, corner_radius=0)
+        info_frame.grid(row=2, column=0, sticky="nsew")
+        info_frame.grid_rowconfigure(0, weight=3)   # vehicle type
+        info_frame.grid_rowconfigure(1, weight=2)   # speed | direction
+        info_frame.grid_columnconfigure(0, weight=1)
+        info_frame.grid_columnconfigure(1, weight=1)
 
-        self._local_vehicle = ctk.CTkLabel(
-            lf, text="Vehicle:  NONE",
-            font=ctk.CTkFont(size=22), text_color=self._FG, anchor="w")
-        self._local_vehicle.pack(fill="x", padx=18, pady=2)
-        self._local_speed = ctk.CTkLabel(
-            lf, text="Speed:    0.0 km/h",
-            font=ctk.CTkFont(size=22), text_color=self._FG, anchor="w")
-        self._local_speed.pack(fill="x", padx=18, pady=2)
-        self._local_direction = ctk.CTkLabel(
-            lf, text="Direction: NONE",
-            font=ctk.CTkFont(size=22), text_color=self._FG, anchor="w")
-        self._local_direction.pack(fill="x", padx=18, pady=(2, 14))
+        # Vehicle type — spans full width
+        self._vehicle_label = ctk.CTkLabel(
+            info_frame, text="—",
+            font=ctk.CTkFont(size=self._vehicle_font_size, weight="bold"),
+            text_color=self._FG)
+        self._vehicle_label.grid(
+            row=0, column=0, columnspan=2, sticky="nsew",
+            padx=self._pad, pady=(self._pad, 0))
 
-        # ── Remote telemetry panel ──
-        rf = ctk.CTkFrame(info, corner_radius=12, fg_color=self._PANEL)
-        rf.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=5)
-        ctk.CTkLabel(rf, text="REMOTE TELEMETRY",
-                     font=ctk.CTkFont(size=16, weight="bold"),
-                     text_color=self._DIM).pack(anchor="w", padx=18, pady=(12, 4))
+        # Speed (left side)
+        self._speed_label = ctk.CTkLabel(
+            info_frame, text="0  km/h",
+            font=ctk.CTkFont(size=self._info_font_size, weight="bold"),
+            text_color=self._DIM)
+        self._speed_label.grid(
+            row=1, column=0, sticky="nsew", padx=self._pad, pady=self._pad)
 
-        self._remote_vehicle = ctk.CTkLabel(
-            rf, text="Vehicle:  NONE",
-            font=ctk.CTkFont(size=22), text_color=self._FG, anchor="w")
-        self._remote_vehicle.pack(fill="x", padx=18, pady=2)
-        self._remote_speed = ctk.CTkLabel(
-            rf, text="Speed:    0.0 km/h",
-            font=ctk.CTkFont(size=22), text_color=self._FG, anchor="w")
-        self._remote_speed.pack(fill="x", padx=18, pady=2)
-        self._remote_direction = ctk.CTkLabel(
-            rf, text="Direction: NONE",
-            font=ctk.CTkFont(size=22), text_color=self._FG, anchor="w")
-        self._remote_direction.pack(fill="x", padx=18, pady=(2, 14))
+        # Direction (right side)
+        self._direction_label = ctk.CTkLabel(
+            info_frame, text="—",
+            font=ctk.CTkFont(size=self._info_font_size, weight="bold"),
+            text_color=self._DIM)
+        self._direction_label.grid(
+            row=1, column=1, sticky="nsew", padx=self._pad, pady=self._pad)
 
-        logger.info("DashboardGUI: widgets created.")
+        # ── Internal animation / state tracking ──
+        self._cur_status: str = "GO"
+        self._cur_color: str = self._GREEN
+        self._pulse_active: bool = False
+        self._pulse_step: int = 0
+        self._pulse_dir: int = 1      # 1 = dimming, -1 = brightening
+        self._pulse_after_id: Optional[str] = None
+        self._fade_after_id: Optional[str] = None
 
-    # ── Public update methods (called from main-thread poll) ──
+        # Cached widget values to skip redundant redraws
+        self._cache_vehicle: str = ""
+        self._cache_speed: str = ""
+        self._cache_direction: str = ""
+
+        logger.info("DashboardGUI: fullscreen display initialised (%dx%d).", sw, sh)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public update API (called from _gui_poll on the main thread)
+    # ──────────────────────────────────────────────────────────────────────
 
     def update_status(self, signal_text: str, emergency: bool = False) -> None:
-        """Update the main status indicator."""
+        """Update the central status indicator with animation."""
         if emergency:
-            color, text = self._RED, "!! EMERGENCY !!"
+            new_status, new_color = "EMERGENCY", self._RED
         elif signal_text == "STOP":
-            color, text = self._RED, "STOP"
+            new_status, new_color = "STOP", self._RED
         elif signal_text in ("GO SLOW", "SLOW"):
-            color, text = self._YELLOW, "SLOW"
+            new_status, new_color = "CAUTION", self._YELLOW
         else:
-            color, text = self._GREEN, "GO"
-        self._status_frame.configure(fg_color=color)
-        self._status_label.configure(text=text)
+            new_status, new_color = "GO", self._GREEN
 
+        if new_status == self._cur_status:
+            return  # no change — skip redraw
+
+        old_status = self._cur_status
+        self._cur_status = new_status
+        self._cur_color = new_color
+
+        # Stop any running pulse before starting a new transition
+        self._stop_pulse()
+
+        # Kick off cross-fade from current label to new label
+        self._animate_status_change(new_status, new_color)
+
+        # Start continuous pulse for STOP / EMERGENCY / CAUTION
+        if new_status in ("STOP", "EMERGENCY"):
+            self._start_pulse(new_color, strong=True)
+        elif new_status == "CAUTION":
+            self._start_pulse(new_color, strong=False)
+
+    def update_vehicle_info(self, label: str, speed: float,
+                            direction: str) -> None:
+        """Update the vehicle info panel (only redraws on change)."""
+        v_text = label.upper().replace("_", " ") if label and label != "none" else "—"
+        s_text = f"{speed:.0f}  km/h" if speed > 0 else "0  km/h"
+        d_text = direction.upper() if direction and direction != "NONE" else "—"
+
+        if v_text != self._cache_vehicle:
+            self._cache_vehicle = v_text
+            self._vehicle_label.configure(text=v_text)
+        if s_text != self._cache_speed:
+            self._cache_speed = s_text
+            self._speed_label.configure(
+                text=s_text,
+                text_color=self._FG if speed > 0 else self._DIM)
+        if d_text != self._cache_direction:
+            self._cache_direction = d_text
+            self._direction_label.configure(
+                text=d_text,
+                text_color=self._FG if d_text != "—" else self._DIM)
+
+    # Backward-compatible aliases used by _gui_poll
     def update_local(self, label: str, speed: float, direction: str) -> None:
-        self._local_vehicle.configure(text=f"Vehicle:  {label.upper()}")
-        self._local_speed.configure(text=f"Speed:    {speed:.1f} km/h")
-        self._local_direction.configure(text=f"Direction: {direction}")
+        pass  # display is unified — handled via update_vehicle_info
 
     def update_remote(self, label: str, speed: float, direction: str) -> None:
-        self._remote_vehicle.configure(text=f"Vehicle:  {label.upper()}")
-        self._remote_speed.configure(text=f"Speed:    {speed:.1f} km/h")
-        self._remote_direction.configure(text=f"Direction: {direction}")
+        pass  # display is unified — handled via update_vehicle_info
 
     def run(self) -> None:
         """Start the tkinter mainloop (blocks)."""
         self.root.mainloop()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Animation helpers
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _animate_status_change(self, text: str, color: str) -> None:
+        """Cross-fade the status label to *text* / *color* over several frames."""
+        self._stop_fade()
+        steps = self._FADE_STEPS
+        self._fade_step = 0
+        self._fade_target_text = text
+        self._fade_target_color = color
+
+        def _step() -> None:
+            self._fade_step += 1
+            t = min(self._fade_step / steps, 1.0)
+            blended = self._blend_color(self._BG, self._fade_target_color, t)
+            self._status_label.configure(
+                text=self._fade_target_text, text_color=blended)
+            self._status_frame.configure(fg_color=self._BG)
+            if t < 1.0:
+                self._fade_after_id = self.root.after(30, _step)
+            else:
+                self._fade_after_id = None
+
+        _step()
+
+    def _start_pulse(self, base_color: str, strong: bool = True) -> None:
+        """Begin a continuous brightness pulse on the status label."""
+        self._pulse_active = True
+        self._pulse_step = 0
+        self._pulse_dir = 1
+        self._pulse_base = base_color
+        self._pulse_min_alpha = 0.35 if strong else 0.60
+
+        def _tick() -> None:
+            if not self._pulse_active:
+                return
+            self._pulse_step += self._pulse_dir
+            if self._pulse_step >= self._PULSE_STEPS:
+                self._pulse_dir = -1
+            elif self._pulse_step <= 0:
+                self._pulse_dir = 1
+            t = self._pulse_step / self._PULSE_STEPS
+            alpha = 1.0 - t * (1.0 - self._pulse_min_alpha)
+            blended = self._blend_color(self._BG, self._pulse_base, alpha)
+            self._status_label.configure(text_color=blended)
+            self._pulse_after_id = self.root.after(
+                self._PULSE_INTERVAL_MS, _tick)
+
+        _tick()
+
+    def _stop_pulse(self) -> None:
+        self._pulse_active = False
+        if self._pulse_after_id is not None:
+            self.root.after_cancel(self._pulse_after_id)
+            self._pulse_after_id = None
+
+    def _stop_fade(self) -> None:
+        if self._fade_after_id is not None:
+            self.root.after_cancel(self._fade_after_id)
+            self._fade_after_id = None
+
+    @staticmethod
+    def _blend_color(c1_hex: str, c2_hex: str, t: float) -> str:
+        """Linearly interpolate between two hex colours."""
+        r1, g1, b1 = int(c1_hex[1:3], 16), int(c1_hex[3:5], 16), int(c1_hex[5:7], 16)
+        r2, g2, b2 = int(c2_hex[1:3], 16), int(c2_hex[3:5], 16), int(c2_hex[5:7], 16)
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1199,8 +1350,13 @@ class SmartRoadAlertHost:
         else:
             self._gui.update_status("GO")
 
-        self._gui.update_local(ld["label"], ld["speed"], ld["direction"])
-        self._gui.update_remote(rd["label"], rd["speed"], rd["direction"])
+        # Show the highest-priority source's vehicle info (unified display)
+        _rank = {"GO": 0, "GO SLOW": 1, "SLOW": 1, "STOP": 2}
+        l_rank = 3 if ld["emergency"] else _rank.get(ld["signal"], 0)
+        r_rank = 3 if rd["emergency"] else _rank.get(rd["signal"], 0)
+        best = ld if l_rank >= r_rank else rd
+        self._gui.update_vehicle_info(
+            best["label"], best["speed"], best["direction"])
 
         self._gui.root.after(50, self._gui_poll)
 
