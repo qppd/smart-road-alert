@@ -29,13 +29,15 @@ This file does NOT import the 'serial' package directly.
 
 from __future__ import annotations
 
-import glob
 import json
 import logging
 import math
 import os
+import queue
 import signal
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -78,6 +80,20 @@ except ImportError:
     dai = None        # type: ignore[assignment]
     _YOLO = None      # type: ignore[assignment]
     _CAMERA_INFERENCE_AVAILABLE = False
+
+try:
+    from gtts import gTTS as _gTTS
+    _GTTS_AVAILABLE = True
+except ImportError:
+    _gTTS = None
+    _GTTS_AVAILABLE = False
+
+try:
+    import customtkinter as ctk
+    _CTK_AVAILABLE = True
+except ImportError:
+    ctk = None  # type: ignore[assignment]
+    _CTK_AVAILABLE = False
 
 # ─── Application Timing Constants ─────────────────────────────────────────────
 
@@ -176,9 +192,9 @@ _LARGE_VEHICLES: frozenset = frozenset({
     "fire_truck", "ambulance",
 })
 _MEDIUM_VEHICLES: frozenset = frozenset({
-    "car", "tricycle", "tuktuk", "kariton", "police_car", "ev_small",
+    "car", "tricycle", "tuktuk", "police_car", "ev_small",
 })
-# All others (motorcycle, bicycle, pedicab, kalesa) are implicitly SMALL.
+# All others (motorcycle, bicycle, pedicab, kalesa, kariton) are implicitly SMALL.
 
 # ─── Alert Signal Thresholds ─────────────────────────────────────────────────
 
@@ -187,6 +203,209 @@ _STOP_SPEED_THRESHOLD: float = 60.0
 
 # Speed (km/h) above which a medium incoming vehicle triggers GO SLOW.
 _SLOW_SPEED_THRESHOLD: float = 20.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TTSManager — Non-blocking text-to-speech
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TTSManager:
+    """Non-blocking text-to-speech manager using gTTS.
+
+    - Background worker thread processes a message queue.
+    - Deduplicates: same message won't repeat within cooldown.
+    - Rate-limits: minimum interval between any playback.
+    """
+
+    _MIN_INTERVAL_S: float = 3.0
+    _SAME_MSG_COOLDOWN_S: float = 10.0
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue[str] = queue.Queue(maxsize=5)
+        self._last_played: dict[str, float] = {}
+        self._last_any: float = 0.0
+        self._running: bool = True
+        self._thread = threading.Thread(
+            target=self._worker, name="tts-worker", daemon=True)
+        self._thread.start()
+        logger.info("TTSManager: worker thread started.")
+
+    def speak(self, text: str, force: bool = False) -> None:
+        """Queue a TTS message (non-blocking, drops if queue full or throttled)."""
+        now = time.monotonic()
+        if not force:
+            if now - self._last_any < self._MIN_INTERVAL_S:
+                return
+            last = self._last_played.get(text)
+            if last is not None and now - last < self._SAME_MSG_COOLDOWN_S:
+                return
+        try:
+            self._queue.put_nowait(text)
+        except queue.Full:
+            pass
+
+    def stop(self) -> None:
+        self._running = False
+        self._thread.join(timeout=3)
+        logger.info("TTSManager: stopped.")
+
+    def _worker(self) -> None:
+        while self._running:
+            try:
+                text = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            now = time.monotonic()
+            self._last_played[text] = now
+            self._last_any = now
+            tmp_path: Optional[str] = None
+            try:
+                tts = _gTTS(text=text, lang='en')
+                fd, tmp_path = tempfile.mkstemp(suffix='.mp3')
+                os.close(fd)
+                tts.save(tmp_path)
+                subprocess.run(
+                    ['mpg123', '-q', tmp_path],
+                    timeout=15, capture_output=True, check=False,
+                )
+                logger.debug("TTS played: %s", text)
+            except FileNotFoundError:
+                logger.warning(
+                    "TTS: 'mpg123' not found — install it for audio playback.")
+            except Exception as exc:
+                logger.warning("TTS playback error: %s", exc)
+            finally:
+                if tmp_path is not None:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DashboardGUI — CustomTkinter outdoor-readable display
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DashboardGUI:
+    """CustomTkinter outdoor-readable dashboard.
+
+    Designed for roadside visibility: large fonts, high-contrast dark
+    background, and color-coded status (GO green, SLOW yellow, STOP red).
+    """
+
+    _GREEN  = "#00CC44"
+    _YELLOW = "#FFB800"
+    _RED    = "#FF2222"
+    _BG     = "#0D1117"
+    _FG     = "#E6EDF3"
+    _DIM    = "#7D8590"
+    _PANEL  = "#161B22"
+
+    def __init__(self) -> None:
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+
+        self.root = ctk.CTk()
+        self.root.title("Smart Road Alert")
+        self.root.geometry("800x600")
+        self.root.configure(fg_color=self._BG)
+        self.root.bind("<F11>", lambda _e: self.root.attributes(
+            "-fullscreen", not self.root.attributes("-fullscreen")))
+
+        # ── Title ──
+        ctk.CTkLabel(
+            self.root, text="SMART ROAD ALERT",
+            font=ctk.CTkFont(size=30, weight="bold"),
+            text_color=self._FG,
+        ).pack(pady=(15, 5))
+
+        # ── Status indicator ──
+        self._status_frame = ctk.CTkFrame(
+            self.root, corner_radius=18, fg_color=self._GREEN, height=130)
+        self._status_frame.pack(fill="x", padx=25, pady=10)
+        self._status_frame.pack_propagate(False)
+        self._status_label = ctk.CTkLabel(
+            self._status_frame, text="GO",
+            font=ctk.CTkFont(size=64, weight="bold"),
+            text_color="#000000")
+        self._status_label.pack(expand=True)
+
+        # ── Info panels container ──
+        info = ctk.CTkFrame(self.root, fg_color="transparent")
+        info.pack(fill="both", expand=True, padx=25, pady=5)
+        info.grid_columnconfigure(0, weight=1)
+        info.grid_columnconfigure(1, weight=1)
+
+        # ── Local detection panel ──
+        lf = ctk.CTkFrame(info, corner_radius=12, fg_color=self._PANEL)
+        lf.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=5)
+        ctk.CTkLabel(lf, text="LOCAL DETECTION",
+                     font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color=self._DIM).pack(anchor="w", padx=18, pady=(12, 4))
+
+        self._local_vehicle = ctk.CTkLabel(
+            lf, text="Vehicle:  NONE",
+            font=ctk.CTkFont(size=22), text_color=self._FG, anchor="w")
+        self._local_vehicle.pack(fill="x", padx=18, pady=2)
+        self._local_speed = ctk.CTkLabel(
+            lf, text="Speed:    0.0 km/h",
+            font=ctk.CTkFont(size=22), text_color=self._FG, anchor="w")
+        self._local_speed.pack(fill="x", padx=18, pady=2)
+        self._local_direction = ctk.CTkLabel(
+            lf, text="Direction: NONE",
+            font=ctk.CTkFont(size=22), text_color=self._FG, anchor="w")
+        self._local_direction.pack(fill="x", padx=18, pady=(2, 14))
+
+        # ── Remote telemetry panel ──
+        rf = ctk.CTkFrame(info, corner_radius=12, fg_color=self._PANEL)
+        rf.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=5)
+        ctk.CTkLabel(rf, text="REMOTE TELEMETRY",
+                     font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color=self._DIM).pack(anchor="w", padx=18, pady=(12, 4))
+
+        self._remote_vehicle = ctk.CTkLabel(
+            rf, text="Vehicle:  NONE",
+            font=ctk.CTkFont(size=22), text_color=self._FG, anchor="w")
+        self._remote_vehicle.pack(fill="x", padx=18, pady=2)
+        self._remote_speed = ctk.CTkLabel(
+            rf, text="Speed:    0.0 km/h",
+            font=ctk.CTkFont(size=22), text_color=self._FG, anchor="w")
+        self._remote_speed.pack(fill="x", padx=18, pady=2)
+        self._remote_direction = ctk.CTkLabel(
+            rf, text="Direction: NONE",
+            font=ctk.CTkFont(size=22), text_color=self._FG, anchor="w")
+        self._remote_direction.pack(fill="x", padx=18, pady=(2, 14))
+
+        logger.info("DashboardGUI: widgets created.")
+
+    # ── Public update methods (called from main-thread poll) ──
+
+    def update_status(self, signal_text: str, emergency: bool = False) -> None:
+        """Update the main status indicator."""
+        if emergency:
+            color, text = self._RED, "!! EMERGENCY !!"
+        elif signal_text == "STOP":
+            color, text = self._RED, "STOP"
+        elif signal_text in ("GO SLOW", "SLOW"):
+            color, text = self._YELLOW, "SLOW"
+        else:
+            color, text = self._GREEN, "GO"
+        self._status_frame.configure(fg_color=color)
+        self._status_label.configure(text=text)
+
+    def update_local(self, label: str, speed: float, direction: str) -> None:
+        self._local_vehicle.configure(text=f"Vehicle:  {label.upper()}")
+        self._local_speed.configure(text=f"Speed:    {speed:.1f} km/h")
+        self._local_direction.configure(text=f"Direction: {direction}")
+
+    def update_remote(self, label: str, speed: float, direction: str) -> None:
+        self._remote_vehicle.configure(text=f"Vehicle:  {label.upper()}")
+        self._remote_speed.configure(text=f"Speed:    {speed:.1f} km/h")
+        self._remote_direction.configure(text=f"Direction: {direction}")
+
+    def run(self) -> None:
+        """Start the tkinter mainloop (blocks)."""
+        self.root.mainloop()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,6 +448,20 @@ class SmartRoadAlertHost:
             "emergency": False,
             "last_seen": 0.0,
         }
+        # ── TTS & GUI state ──────────────────────────────────────────────────
+        self._tts: Optional[TTSManager] = None
+        self._gui: Optional[DashboardGUI] = None
+        self._display_lock = threading.Lock()
+        self._local_display: dict = {
+            "label": "none", "speed": 0.0, "direction": "NONE",
+            "signal": "GO", "emergency": False,
+        }
+        self._remote_display: dict = {
+            "label": "none", "speed": 0.0, "direction": "NONE",
+            "signal": "GO", "emergency": False,
+        }
+        self._tts_last_signal: str = "GO"
+        self._tts_last_remote_signal: str = ""
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -238,8 +471,16 @@ class SmartRoadAlertHost:
         if self._serial is not None:
             self._serial.start()
         self._running = True
+        if _GTTS_AVAILABLE:
+            self._tts = TTSManager()
         self.start_camera_inference()
-        self._run_loop()
+        if _CTK_AVAILABLE:
+            self._gui = DashboardGUI()
+            self._gui.root.protocol("WM_DELETE_WINDOW", self._on_gui_close)
+            self._gui_poll()
+            self._gui.run()  # blocks on mainloop
+        else:
+            self._run_loop()
 
     def stop(self) -> None:
         """Graceful shutdown — drain queues, stop threads, close ports."""
@@ -250,6 +491,8 @@ class SmartRoadAlertHost:
             self._camera_thread.join(timeout=2)
         if self._serial is not None:
             self._serial.stop()
+        if self._tts is not None:
+            self._tts.stop()
         if _CAMERA_INFERENCE_AVAILABLE and cv2 is not None:
             cv2.destroyAllWindows()
         logger.info("Shutdown complete.")
@@ -531,6 +774,7 @@ class SmartRoadAlertHost:
             priority = self._get_priority(label, emergency_active)
             signal   = self._get_alert_signal(
                 priority, direction, speed_kmh, emergency_active)
+            h_direction = self._compute_horizontal_direction(track["last_pos"][0])
 
             # ── Overlay colour (BGR) ──
             if emergency_active:
@@ -565,6 +809,7 @@ class SmartRoadAlertHost:
                     "label": label, "signal": signal,
                     "speed": speed_kmh, "priority": priority,
                     "emergency": emergency_active,
+                    "h_direction": h_direction,
                 }
 
             # ── Telemetry (rate-limited per track) ──
@@ -577,6 +822,7 @@ class SmartRoadAlertHost:
                 "label":            label,
                 "priority":         priority,
                 "direction":        direction,
+                "h_direction":      h_direction,
                 "speed":            speed_kmh,
                 "distance":         distance,
                 "emergency_active": emergency_active,
@@ -594,11 +840,33 @@ class SmartRoadAlertHost:
 
             self.send_via_hc12(payload)
 
-        # ── Send display command for highest-priority incoming threat ──
+        # ── Update local display state and send command ──
         if best_alert is not None and best_alert["signal"] != "GO":
-            self._send_display_command(**best_alert)
+            h_dir = best_alert.get("h_direction", "FRONT")
+            with self._display_lock:
+                self._local_display.update({
+                    "label": best_alert["label"],
+                    "speed": best_alert["speed"],
+                    "direction": h_dir,
+                    "signal": best_alert["signal"],
+                    "emergency": best_alert["emergency"],
+                })
+            self._tts_local_alert(
+                best_alert["label"], best_alert["speed"],
+                h_dir, best_alert["signal"], best_alert["emergency"])
+            self._send_display_command(
+                best_alert["label"], best_alert["signal"],
+                best_alert["speed"], best_alert["priority"],
+                best_alert["emergency"])
             self._current_alert = best_alert
         elif not self._tracks:
+            with self._display_lock:
+                self._local_display.update({
+                    "label": "none", "speed": 0.0,
+                    "direction": "NONE", "signal": "GO",
+                    "emergency": False,
+                })
+            self._tts_local_alert("none", 0.0, "NONE", "GO", False)
             self._send_display_command("clear", "GO", 0.0, "LOW", False)
             self._current_alert = {}
 
@@ -710,6 +978,58 @@ class SmartRoadAlertHost:
         if priority == "MEDIUM":
             return "GO SLOW" if speed >= _SLOW_SPEED_THRESHOLD else "GO"
         return "GO"
+
+    @staticmethod
+    def _compute_horizontal_direction(cx: float, frame_width: float = 640.0) -> str:
+        """Derive LEFT / RIGHT / FRONT from the bounding-box centroid x-position."""
+        third = frame_width / 3.0
+        if cx < third:
+            return "LEFT"
+        if cx > 2 * third:
+            return "RIGHT"
+        return "FRONT"
+
+    def _tts_local_alert(self, label: str, speed: float,
+                         h_dir: str, signal: str, emergency: bool) -> None:
+        """Speak a local-detection alert when the overall signal changes."""
+        if self._tts is None:
+            return
+        new_key = "EMERGENCY" if emergency else signal
+        old_key = self._tts_last_signal
+        if new_key == old_key:
+            return
+        self._tts_last_signal = new_key
+        name = label.replace("_", " ")
+        if emergency:
+            self._tts.speak(f"Emergency! {name} approaching", force=True)
+        elif signal == "STOP":
+            self._tts.speak("Stop. Large vehicle approaching at high speed")
+        elif signal in ("GO SLOW", "SLOW"):
+            self._tts.speak(f"Slow down. {name} detected from {h_dir.lower()}")
+        elif signal == "GO" and old_key in ("STOP", "GO SLOW", "SLOW", "EMERGENCY"):
+            self._tts.speak("Road is clear")
+
+    def _tts_remote_alert(self, label: str, speed: float,
+                          signal: str, emergency: bool) -> None:
+        """Speak a remote-telemetry alert when the remote signal changes."""
+        if self._tts is None:
+            return
+        new_key = "EMERGENCY" if emergency else signal
+        old_key = self._tts_last_remote_signal
+        if new_key == old_key:
+            return
+        self._tts_last_remote_signal = new_key
+        name = label.replace("_", " ")
+        if emergency:
+            self._tts.speak(
+                f"Warning! Emergency {name} approaching from opposite side",
+                force=True)
+        elif signal == "STOP":
+            self._tts.speak(f"Incoming {name} at high speed from opposite side")
+        elif signal in ("GO SLOW", "SLOW"):
+            self._tts.speak("Vehicle approaching from opposite side")
+        elif signal == "GO" and old_key in ("STOP", "GO SLOW", "SLOW", "EMERGENCY"):
+            self._tts.speak("Opposite side clear")
 
     def _send_display_command(self, label: str, signal: str, speed: float,
                               priority: str, emergency: bool) -> None:
@@ -829,6 +1149,67 @@ class SmartRoadAlertHost:
             else:
                 time.sleep(POLL_INTERVAL_S)
 
+    # ─── GUI Polling (CustomTkinter mainloop callbacks) ───────────────────────
+
+    def _gui_poll(self) -> None:
+        """Periodic callback inside the tkinter mainloop; replaces _run_loop."""
+        if not self._running:
+            self._gui.root.destroy()
+            return
+
+        now = time.monotonic()
+
+        # ── Process ESP32 messages ──
+        if self._serial is not None:
+            while True:
+                msg = self._serial.receive()
+                if msg is None:
+                    break
+                self._handle_esp32_message(msg)
+
+        # ── Periodic commands to ESP32 ──
+        if self._serial is not None and self._serial.is_connected():
+            if now - self._t_last_ping >= PING_INTERVAL_S:
+                self._t_last_ping = now
+                self._serial.send('{"cmd":"ping"}')
+            if now - self._t_last_status >= STATUS_INTERVAL_S:
+                self._t_last_status = now
+                self._serial.send('{"cmd":"status"}')
+            if now - self._t_last_hc12_ping >= HC12_PING_INTERVAL_S:
+                self._t_last_hc12_ping = now
+                self.send_via_hc12({"type": "RPI_PING", "node": NODE_ID})
+
+        # ── Update GUI from display dicts ──
+        with self._display_lock:
+            ld = dict(self._local_display)
+            rd = dict(self._remote_display)
+
+        # Auto-reset remote display after 5 s of no HC-12 data
+        if time.time() - self._last_telemetry["last_seen"] > 5.0:
+            rd = {"label": "none", "speed": 0.0, "direction": "NONE",
+                  "signal": "GO", "emergency": False}
+
+        # Determine highest signal for status bar
+        if ld["emergency"] or rd["emergency"]:
+            self._gui.update_status("STOP", emergency=True)
+        elif ld["signal"] == "STOP" or rd["signal"] == "STOP":
+            self._gui.update_status("STOP")
+        elif ld["signal"] in ("GO SLOW", "SLOW") or rd["signal"] in ("GO SLOW", "SLOW"):
+            self._gui.update_status("SLOW")
+        else:
+            self._gui.update_status("GO")
+
+        self._gui.update_local(ld["label"], ld["speed"], ld["direction"])
+        self._gui.update_remote(rd["label"], rd["speed"], rd["direction"])
+
+        self._gui.root.after(50, self._gui_poll)
+
+    def _on_gui_close(self) -> None:
+        """Handle CustomTkinter window close event."""
+        self._running = False
+        self._camera_running = False
+        self._gui.root.destroy()
+
     # ─── Message Dispatcher ───────────────────────────────────────────────────
 
     def _handle_esp32_message(self, raw: str) -> None:
@@ -945,6 +1326,13 @@ class SmartRoadAlertHost:
                 "emergency": False,
                 "last_seen": time.time(),
             })
+            with self._display_lock:
+                self._remote_display.update({
+                    "label": "none", "speed": 0.0,
+                    "direction": "NONE", "signal": "GO",
+                    "emergency": False,
+                })
+            self._tts_remote_alert("none", 0.0, "GO", False)
             logger.debug("REMOTE → no vehicle | source=%s", node)
             return
 
@@ -970,6 +1358,13 @@ class SmartRoadAlertHost:
         if local_direction == "incoming":
             signal = self._get_alert_signal(priority, "incoming", speed, emergency)
             self._send_display_command(label, signal, speed, priority, emergency)
+            with self._display_lock:
+                self._remote_display.update({
+                    "label": label, "speed": speed,
+                    "direction": data.get("h_direction", "FRONT"),
+                    "signal": signal, "emergency": emergency,
+                })
+            self._tts_remote_alert(label, speed, signal, emergency)
 
             if emergency:
                 logger.warning(
@@ -981,6 +1376,13 @@ class SmartRoadAlertHost:
                     "REMOTE ALERT: %s toward us at %.1f km/h — %s",
                     label, speed, signal,
                 )
+        else:
+            with self._display_lock:
+                self._remote_display.update({
+                    "label": label, "speed": speed,
+                    "direction": "AWAY", "signal": "GO",
+                    "emergency": False,
+                })
 
     def _process_vehicle_telemetry(self, speed: float, distance: float, source: str) -> None:
         """
