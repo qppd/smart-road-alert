@@ -480,6 +480,20 @@ class DashboardGUI:
     def update_remote(self, label: str, speed: float, direction: str) -> None:
         pass  # display is unified — handled via update_vehicle_info
 
+    def update_display(self, status: str, label: str, speed: float,
+                       direction: str, emergency: bool = False) -> None:
+        """Central GUI update — single entry point from SmartRoadAlertHost.
+
+        Args:
+            status:    GO / SLOW / STOP
+            label:     vehicle class string (e.g. 'truck', 'car')
+            speed:     speed in km/h
+            direction: LEFT / RIGHT / FRONT / NONE
+            emergency: True to trigger emergency pulse
+        """
+        self.update_status(status, emergency=emergency)
+        self.update_vehicle_info(label, speed, direction)
+
     def run(self) -> None:
         """Start the tkinter mainloop (blocks)."""
         self.root.mainloop()
@@ -611,6 +625,15 @@ class SmartRoadAlertHost:
         }
         self._tts_last_signal: str = "GO"
         self._tts_last_remote_signal: str = ""
+        # ── GUI smoothing / cross-RPI timing ────────────────────────────────────
+        # Monotonic timestamp of the last *real* (non-empty) remote vehicle packet.
+        self._last_received_time: float = 0.0
+        # How long to hold the last remote display state after telemetry stops.
+        self._REMOTE_HOLD_S: float = 3.0
+        # Monotonic timestamp of the last frame where local camera had an active alert.
+        self._last_local_active_time: float = 0.0
+        # How long to consider local detection "active" after the last confirmed frame.
+        self._LOCAL_ACTIVE_HOLD_S: float = 2.0
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -991,6 +1014,7 @@ class SmartRoadAlertHost:
 
         # ── Update local display state and send command ──
         if best_alert is not None and best_alert["signal"] != "GO":
+            self._last_local_active_time = time.monotonic()   # mark local as active
             h_dir = best_alert.get("h_direction", "FRONT")
             with self._display_lock:
                 self._local_display.update({
@@ -1328,28 +1352,11 @@ class SmartRoadAlertHost:
                 self._t_last_hc12_ping = now
                 self.send_via_hc12({"type": "RPI_PING", "node": NODE_ID})
 
-        # ── Update GUI from REMOTE telemetry ONLY ──
-        with self._display_lock:
-            rd = dict(self._remote_display)
-
-        # Auto-reset remote display after 5 s of no HC-12 data
-        if time.time() - self._last_telemetry["last_seen"] > 5.0:
-            rd = {"label": "none", "speed": 0.0, "direction": "NONE",
-                  "signal": "GO", "emergency": False}
-
-        # Determine status from remote telemetry only (GO / SLOW / STOP)
-        if rd["emergency"]:
-            self._gui.update_status("STOP", emergency=True)
-        elif rd["signal"] == "STOP":
-            self._gui.update_status("STOP")
-        elif rd["signal"] in ("GO SLOW", "SLOW"):
-            self._gui.update_status("SLOW")
-        else:
-            self._gui.update_status("GO")
-
-        # Show remote vehicle info only
-        self._gui.update_vehicle_info(
-            rd["label"], rd["speed"], rd["direction"])
+        # ── Compute smoothed, cross-RPI–aware display state then update GUI ──
+        disp = self._decide_display_state(now)
+        self._gui.update_display(
+            disp["status"], disp["label"], disp["speed"],
+            disp["direction"], disp.get("emergency", False))
 
         self._gui.root.after(50, self._gui_poll)
 
@@ -1358,6 +1365,118 @@ class SmartRoadAlertHost:
         self._running = False
         self._camera_running = False
         self._gui.root.destroy()
+
+    # ─── Cross-RPI Display Decision ───────────────────────────────────────────
+
+    def _decide_display_state(self, now: float) -> dict:
+        """Compute what the GUI should show based on local + remote state.
+
+        Rules (symmetric peer-to-peer):
+        ─ Case 1/2 (one side detecting):
+          • Detecting side   → GO (no incoming threat).
+          • Receiving side   → SLOW / STOP per remote telemetry.
+        ─ Case 3 (both sides detecting simultaneously):
+          • Priority winner  → GO.
+          • Loser            → SLOW / STOP.
+        ─ Neither active     → GO (road clear).
+
+        Smoothing:
+          Remote display is held for ``_REMOTE_HOLD_S`` seconds after the last
+          received non-empty packet, preventing flickering when frames are
+          briefly missed.  Local activity uses ``_LOCAL_ACTIVE_HOLD_S`` for
+          the same reason.
+        """
+        remote_fresh = (now - self._last_received_time) < self._REMOTE_HOLD_S
+        local_active = (now - self._last_local_active_time) < self._LOCAL_ACTIVE_HOLD_S
+
+        _go: dict = {
+            "status": "GO", "label": "none",
+            "speed": 0.0, "direction": "NONE", "emergency": False,
+        }
+
+        if not remote_fresh:
+            # No recent remote telemetry → road clear from our perspective.
+            return _go
+
+        # Remote is fresh: read latest snapshot.
+        with self._display_lock:
+            rd = dict(self._remote_display)
+
+        if not local_active:
+            # Case 1/2: only remote is active → show their signal.
+            return {
+                "status":    rd["signal"],
+                "label":     rd["label"],
+                "speed":     rd["speed"],
+                "direction": rd["direction"],
+                "emergency": rd["emergency"],
+            }
+
+        # Case 3: both sides detecting → run priority decision.
+        with self._display_lock:
+            ld = dict(self._local_display)
+
+        winner = self._priority_winner(ld, rd)
+        if winner == "local":
+            # We have right-of-way → show GO, still display remote vehicle info
+            # so our driver knows what is on the other side.
+            return {
+                "status":    "GO",
+                "label":     rd["label"],
+                "speed":     rd["speed"],
+                "direction": rd["direction"],
+                "emergency": False,  # priority won, no emergency pulse
+            }
+        else:
+            # Remote has right-of-way → show SLOW / STOP.
+            return {
+                "status":    rd["signal"],
+                "label":     rd["label"],
+                "speed":     rd["speed"],
+                "direction": rd["direction"],
+                "emergency": rd["emergency"],
+            }
+
+    @staticmethod
+    def _priority_winner(local: dict, remote: dict) -> str:
+        """Determine which side has right-of-way in a head-on scenario.
+
+        Returns ``"local"`` if the local vehicle should proceed (show GO),
+        or ``"remote"`` if the remote vehicle has priority (show SLOW/STOP).
+
+        Decision order:
+        1. Emergency class always beats non-emergency.
+        2. Larger vehicle class wins (bus/truck > car > motorcycle).
+        3. Higher speed wins (more kinetic energy, harder to stop).
+        4. Tie → remote wins (conservative — slow down by default).
+        """
+        local_em  = local.get("emergency", False)
+        remote_em = remote.get("emergency", False)
+
+        if local_em and not remote_em:
+            return "local"
+        if remote_em and not local_em:
+            return "remote"
+
+        def _size_rank(label: str) -> int:
+            if label in _LARGE_VEHICLES:
+                return 3
+            if label in _MEDIUM_VEHICLES:
+                return 2
+            return 1
+
+        local_rank  = _size_rank(local.get("label", ""))
+        remote_rank = _size_rank(remote.get("label", ""))
+        if local_rank != remote_rank:
+            return "local" if local_rank > remote_rank else "remote"
+
+        local_speed  = local.get("speed", 0.0)
+        remote_speed = remote.get("speed", 0.0)
+        if abs(local_speed - remote_speed) > 5.0:
+            return "local" if local_speed > remote_speed else "remote"
+
+        # Tie → conservative default: yield to remote.
+        return "remote"
 
     # ─── Message Dispatcher ───────────────────────────────────────────────────
 
@@ -1463,8 +1582,8 @@ class SmartRoadAlertHost:
 
         # ── No-vehicle reset packet: speed==0 && direction=="none" ──────────
         # The remote RPi sends this every second when its YOLO has no
-        # detections.  Reset the HUD immediately and return — no alert logic
-        # or display command needed.
+        # detections.  Update the cv2 HUD overlay only; the GUI smoothing
+        # timer (_last_received_time) handles the 3-second hold before clearing.
         if speed == 0.0 and direction in ("none", "unknown") and not emergency:
             self._last_telemetry.update({
                 "label":     "none",
@@ -1475,12 +1594,6 @@ class SmartRoadAlertHost:
                 "emergency": False,
                 "last_seen": time.time(),
             })
-            with self._display_lock:
-                self._remote_display.update({
-                    "label": "none", "speed": 0.0,
-                    "direction": "NONE", "signal": "GO",
-                    "emergency": False,
-                })
             self._tts_remote_alert("none", 0.0, "GO", False)
             logger.debug("REMOTE → no vehicle | source=%s", node)
             return
@@ -1491,6 +1604,7 @@ class SmartRoadAlertHost:
         )
 
         # ── Update HUD overlay with received HC-12 data ──
+        self._last_received_time = time.monotonic()   # mark remote as active
         self._last_telemetry.update({
             "label":     label,
             "speed":     speed,
