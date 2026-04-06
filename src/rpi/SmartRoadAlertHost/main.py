@@ -1615,37 +1615,34 @@ class SmartRoadAlertHost:
             "last_seen": time.time(),
         })
 
-        # Sender's "outgoing" means vehicle is heading TOWARD us.
-        local_direction = "incoming" if direction == "outgoing" else "outgoing"
+        # Any active remote vehicle = local side must be warned (SLOW / STOP).
+        # The camera-relative "incoming"/"outgoing" direction is NOT used to
+        # gate the alert — either direction means a vehicle is occupying the
+        # road and the local side needs to react.
+        signal = self._get_alert_signal(priority, "incoming", speed, emergency)
+        h_dir  = data.get("h_direction", "FRONT")
 
-        if local_direction == "incoming":
-            signal = self._get_alert_signal(priority, "incoming", speed, emergency)
-            self._send_display_command(label, signal, speed, priority, emergency)
-            with self._display_lock:
-                self._remote_display.update({
-                    "label": label, "speed": speed,
-                    "direction": data.get("h_direction", "FRONT"),
-                    "signal": signal, "emergency": emergency,
-                })
-            self._tts_remote_alert(label, speed, signal, emergency)
+        self._send_display_command(label, signal, speed, priority, emergency)
+        with self._display_lock:
+            self._remote_display.update({
+                "label":     label,
+                "speed":     speed,
+                "direction": h_dir,
+                "signal":    signal,
+                "emergency": emergency,
+            })
+        self._tts_remote_alert(label, speed, signal, emergency)
 
-            if emergency:
-                logger.warning(
-                    "REMOTE EMERGENCY: active %s heading toward us at %.1f km/h",
-                    label, speed,
-                )
-            elif signal in ("STOP", "GO SLOW"):
-                logger.warning(
-                    "REMOTE ALERT: %s toward us at %.1f km/h — %s",
-                    label, speed, signal,
-                )
-        else:
-            with self._display_lock:
-                self._remote_display.update({
-                    "label": label, "speed": speed,
-                    "direction": "AWAY", "signal": "GO",
-                    "emergency": False,
-                })
+        if emergency:
+            logger.warning(
+                "REMOTE EMERGENCY: active %s at %.1f km/h from %s",
+                label, speed, node,
+            )
+        elif signal in ("STOP", "GO SLOW", "SLOW"):
+            logger.warning(
+                "REMOTE ALERT: %s at %.1f km/h from %s — %s",
+                label, speed, node, signal,
+            )
 
     def _process_vehicle_telemetry(self, speed: float, distance: float, source: str) -> None:
         """
