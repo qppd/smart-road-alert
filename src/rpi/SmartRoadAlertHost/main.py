@@ -803,6 +803,10 @@ class SmartRoadAlertHost:
         if _CTK_AVAILABLE:
             self._gui = DashboardGUI()
             self._gui.root.protocol("WM_DELETE_WINDOW", self._on_gui_close)
+            # Pre-create the OpenCV preview window on the main thread so
+            # the first imshow() in _gui_poll doesn't initialise it mid-loop.
+            if CAMERA_INFERENCE_ENABLED and _CAMERA_INFERENCE_AVAILABLE and cv2 is not None:
+                cv2.namedWindow("Smart Road Alert — Camera Feed", cv2.WINDOW_NORMAL)
             self._gui_poll()
             self._gui.run()  # blocks on mainloop
         else:
@@ -1511,6 +1515,18 @@ class SmartRoadAlertHost:
         self._gui.update_display(
             disp["status"], disp["label"], disp["speed"],
             disp["direction"], disp.get("emergency", False))
+
+        # ── Camera feed preview (debug) — shown alongside the CTk GUI ──
+        if CAMERA_INFERENCE_ENABLED and _CAMERA_INFERENCE_AVAILABLE and cv2 is not None:
+            with self._frame_lock:
+                frame = (
+                    self._latest_frame.copy()
+                    if self._latest_frame is not None
+                    else None
+                )
+            if frame is not None:
+                cv2.imshow("Smart Road Alert — Camera Feed", frame)
+            cv2.waitKey(1)   # non-blocking: process GUI events only
 
         self._gui.root.after(50, self._gui_poll)
 
