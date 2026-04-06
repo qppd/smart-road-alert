@@ -534,7 +534,7 @@ class DashboardGUI:
                 self._vehicle_image_label.configure(image=img, text="")
             else:
                 self._vehicle_image_label.configure(
-                    image="", text="\U0001F697" if v_text != "—" else "—")
+                    image=None, text="\U0001F697" if v_text != "—" else "—")
         if s_text != self._cache_speed:
             self._cache_speed = s_text
             self._speed_label.configure(
