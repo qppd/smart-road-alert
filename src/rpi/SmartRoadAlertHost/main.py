@@ -89,6 +89,13 @@ except ImportError:
     _GTTS_AVAILABLE = False
 
 try:
+    from PIL import Image as _PILImage
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PILImage = None  # type: ignore[assignment]
+    _PIL_AVAILABLE = False
+
+try:
     import customtkinter as ctk
     _CTK_AVAILABLE = True
 except ImportError:
@@ -188,13 +195,13 @@ _EMERGENCY_VARIANCE_THRESHOLD: float = 4.0
 # ─── Vehicle Size Classification ─────────────────────────────────────────────
 
 _LARGE_VEHICLES: frozenset = frozenset({
-    "bus", "truck", "van", "jeepney", "ev_large",
+    "bus", "truck", "van", "jeepney",
     "fire_truck", "ambulance",
 })
 _MEDIUM_VEHICLES: frozenset = frozenset({
-    "car", "tricycle", "tuktuk", "police_car", "ev_small",
+    "car", "tricycle", "tuktuk", "police_car", "kalesa", "ev_large", "kariton"
 })
-# All others (motorcycle, bicycle, pedicab, kalesa, kariton) are implicitly SMALL.
+# All others (motorcycle, bicycle, pedicab) are implicitly SMALL.
 
 # ─── Alert Signal Thresholds ─────────────────────────────────────────────────
 
@@ -336,24 +343,95 @@ class DashboardGUI:
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         self._s = min(sw, sh)                  # reference dimension
-        self._status_font_size = max(int(self._s * 0.18), 72)
-        self._vehicle_font_size = max(int(self._s * 0.055), 28)
-        self._info_font_size = max(int(self._s * 0.04), 22)
-        self._header_font_size = max(int(self._s * 0.022), 14)
+        self._status_font_size  = max(int(self._s * 0.18), 72)
+        self._vehicle_font_size = max(int(self._s * 0.07),  36)
+        self._info_font_size    = max(int(self._s * 0.045), 24)
+        self._header_font_size  = max(int(self._s * 0.025), 14)
+        self._emerg_font_size   = max(int(self._s * 0.055), 30)
         self._pad = max(int(self._s * 0.02), 10)
 
-        # ── Root grid: status top (weight 5), info bottom (weight 2) ──
-        self.root.grid_rowconfigure(0, weight=5)
-        self.root.grid_rowconfigure(1, weight=0)    # separator
-        self.root.grid_rowconfigure(2, weight=2)
+        # ── Image cache and source directory ──
+        self._image_cache: dict = {}
+        self._IMAGES_DIR = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "images")
+        # Target bounding-box for vehicle thumbnails
+        self._image_size = (
+            max(int(sw * 0.15), 120),
+            max(int(sh * 0.20), 100),
+        )
+
+        # ── Root grid:
+        #     row 0 (weight 2) → top_frame    : image | label | speed
+        #     row 1 (weight 0) → separator
+        #     row 2 (weight 5) → middle_frame : STATUS (dominant)
+        #     row 3 (weight 0) → separator
+        #     row 4 (weight 1) → bottom_frame : EMERGENCY (hidden by default)
+        self.root.grid_rowconfigure(0, weight=2)
+        self.root.grid_rowconfigure(1, weight=0)
+        self.root.grid_rowconfigure(2, weight=5)
+        self.root.grid_rowconfigure(3, weight=0)
+        self.root.grid_rowconfigure(4, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
 
         # ══════════════════════════════════════════════════════════════════
-        # STATUS ZONE — dominates ~65 % of screen
+        # TOP FRAME — Row 1: vehicle image | label | speed+direction
+        # ══════════════════════════════════════════════════════════════════
+        top_frame = ctk.CTkFrame(self.root, fg_color=self._PANEL, corner_radius=0)
+        top_frame.grid(row=0, column=0, sticky="nsew")
+        top_frame.grid_columnconfigure(0, weight=2)   # image cell
+        top_frame.grid_columnconfigure(1, weight=3)   # label cell
+        top_frame.grid_columnconfigure(2, weight=2)   # speed cell
+        top_frame.grid_rowconfigure(0, weight=1)
+
+        # Col 0 — vehicle image (or placeholder text when unavailable)
+        self._vehicle_image_label = ctk.CTkLabel(
+            top_frame, text="—",
+            font=ctk.CTkFont(size=self._info_font_size),
+            text_color=self._DIM)
+        self._vehicle_image_label.grid(
+            row=0, column=0, sticky="nsew",
+            padx=self._pad, pady=self._pad)
+
+        # Col 1 — vehicle type label (large bold)
+        self._vehicle_label = ctk.CTkLabel(
+            top_frame, text="—",
+            font=ctk.CTkFont(size=self._vehicle_font_size, weight="bold"),
+            text_color=self._FG)
+        self._vehicle_label.grid(
+            row=0, column=1, sticky="nsew",
+            padx=self._pad, pady=self._pad)
+
+        # Col 2 — speed (top) + direction (bottom) stacked
+        speed_col = ctk.CTkFrame(top_frame, fg_color=self._PANEL, corner_radius=0)
+        speed_col.grid(row=0, column=2, sticky="nsew",
+                       padx=self._pad, pady=self._pad)
+        speed_col.grid_rowconfigure(0, weight=2)
+        speed_col.grid_rowconfigure(1, weight=1)
+        speed_col.grid_columnconfigure(0, weight=1)
+
+        self._speed_label = ctk.CTkLabel(
+            speed_col, text="0  km/h",
+            font=ctk.CTkFont(size=self._info_font_size, weight="bold"),
+            text_color=self._DIM)
+        self._speed_label.grid(row=0, column=0, sticky="nsew")
+
+        self._direction_label = ctk.CTkLabel(
+            speed_col, text="—",
+            font=ctk.CTkFont(size=self._header_font_size, weight="bold"),
+            text_color=self._DIM)
+        self._direction_label.grid(row=1, column=0, sticky="nsew")
+
+        # ── Thin horizontal divider ──
+        ctk.CTkFrame(
+            self.root, fg_color=self._BORDER, height=2, corner_radius=0
+        ).grid(row=1, column=0, sticky="ew")
+
+        # ══════════════════════════════════════════════════════════════════
+        # MIDDLE FRAME — Row 2: GO / SLOW / STOP  (dominant)
         # ══════════════════════════════════════════════════════════════════
         self._status_frame = ctk.CTkFrame(
             self.root, fg_color=self._BG, corner_radius=0)
-        self._status_frame.grid(row=0, column=0, sticky="nsew")
+        self._status_frame.grid(row=2, column=0, sticky="nsew")
         self._status_frame.grid_rowconfigure(0, weight=1)
         self._status_frame.grid_columnconfigure(0, weight=1)
 
@@ -366,43 +444,25 @@ class DashboardGUI:
         # ── Thin horizontal divider ──
         ctk.CTkFrame(
             self.root, fg_color=self._BORDER, height=2, corner_radius=0
-        ).grid(row=1, column=0, sticky="ew")
+        ).grid(row=3, column=0, sticky="ew")
 
         # ══════════════════════════════════════════════════════════════════
-        # INFO ZONE — vehicle type, speed, direction
+        # BOTTOM FRAME — Row 3: EMERGENCY indicator (hidden by default)
         # ══════════════════════════════════════════════════════════════════
-        info_frame = ctk.CTkFrame(
-            self.root, fg_color=self._PANEL, corner_radius=0)
-        info_frame.grid(row=2, column=0, sticky="nsew")
-        info_frame.grid_rowconfigure(0, weight=3)   # vehicle type
-        info_frame.grid_rowconfigure(1, weight=2)   # speed | direction
-        info_frame.grid_columnconfigure(0, weight=1)
-        info_frame.grid_columnconfigure(1, weight=1)
+        self._emergency_frame = ctk.CTkFrame(
+            self.root, fg_color="#1A0000", corner_radius=0)
+        self._emergency_frame.grid(row=4, column=0, sticky="nsew")
+        self._emergency_frame.grid_rowconfigure(0, weight=1)
+        self._emergency_frame.grid_columnconfigure(0, weight=1)
 
-        # Vehicle type — spans full width
-        self._vehicle_label = ctk.CTkLabel(
-            info_frame, text="—",
-            font=ctk.CTkFont(size=self._vehicle_font_size, weight="bold"),
-            text_color=self._FG)
-        self._vehicle_label.grid(
-            row=0, column=0, columnspan=2, sticky="nsew",
-            padx=self._pad, pady=(self._pad, 0))
-
-        # Speed (left side)
-        self._speed_label = ctk.CTkLabel(
-            info_frame, text="0  km/h",
-            font=ctk.CTkFont(size=self._info_font_size, weight="bold"),
-            text_color=self._DIM)
-        self._speed_label.grid(
-            row=1, column=0, sticky="nsew", padx=self._pad, pady=self._pad)
-
-        # Direction (right side)
-        self._direction_label = ctk.CTkLabel(
-            info_frame, text="—",
-            font=ctk.CTkFont(size=self._info_font_size, weight="bold"),
-            text_color=self._DIM)
-        self._direction_label.grid(
-            row=1, column=1, sticky="nsew", padx=self._pad, pady=self._pad)
+        self._emergency_label = ctk.CTkLabel(
+            self._emergency_frame,
+            text="\U0001F6A8  EMERGENCY  \U0001F6A8",
+            font=ctk.CTkFont(size=self._emerg_font_size, weight="bold"),
+            text_color=self._RED)
+        self._emergency_label.grid(row=0, column=0, sticky="nsew")
+        # Hidden until an emergency is signalled
+        self._emergency_frame.grid_remove()
 
         # ── Internal animation / state tracking ──
         self._cur_status: str = "GO"
@@ -412,11 +472,16 @@ class DashboardGUI:
         self._pulse_dir: int = 1      # 1 = dimming, -1 = brightening
         self._pulse_after_id: Optional[str] = None
         self._fade_after_id: Optional[str] = None
+        self._blink_active: bool = False
+        self._blink_visible: bool = True
+        self._blink_after_id: Optional[str] = None
+        self._emergency_visible: bool = False
 
         # Cached widget values to skip redundant redraws
         self._cache_vehicle: str = ""
         self._cache_speed: str = ""
         self._cache_direction: str = ""
+        self._cache_emergency: Optional[bool] = None
 
         logger.info("DashboardGUI: fullscreen display initialised (%dx%d).", sw, sh)
 
@@ -462,6 +527,14 @@ class DashboardGUI:
         if v_text != self._cache_vehicle:
             self._cache_vehicle = v_text
             self._vehicle_label.configure(text=v_text)
+            # Load and display vehicle thumbnail (cached, no I/O on repeat calls)
+            clean_label = label.lower() if label and label not in ("none", "clear") else ""
+            img = self._load_vehicle_image(clean_label) if clean_label else None
+            if img is not None:
+                self._vehicle_image_label.configure(image=img, text="")
+            else:
+                self._vehicle_image_label.configure(
+                    image="", text="\U0001F697" if v_text != "—" else "—")
         if s_text != self._cache_speed:
             self._cache_speed = s_text
             self._speed_label.configure(
@@ -493,6 +566,87 @@ class DashboardGUI:
         """
         self.update_status(status, emergency=emergency)
         self.update_vehicle_info(label, speed, direction)
+        self.update_emergency(emergency)
+
+    def update_emergency(self, emergency: bool) -> None:
+        """Show or hide the emergency indicator row (with blinking animation)."""
+        if emergency == self._cache_emergency:
+            return
+        self._cache_emergency = emergency
+        if emergency:
+            self._emergency_frame.grid()
+            self._emergency_visible = True
+            self._start_blink()
+        else:
+            self._stop_blink()
+            self._emergency_visible = False
+            self._emergency_frame.grid_remove()
+
+    def _load_vehicle_image(self, label: str) -> Optional[object]:
+        """Return a cached ``ctk.CTkImage`` for *label*, or ``None``.
+
+        Images are loaded once from ``images/<label>.jpg`` (or .jpeg/.png)
+        and then stored in ``_image_cache``.  A ``None`` sentinel is stored
+        on failure, preventing repeated failed disk lookups.
+        """
+        if not _PIL_AVAILABLE or not label:
+            return None
+        if label in self._image_cache:
+            return self._image_cache[label]
+        img_path: Optional[str] = None
+        for ext in (".jpg", ".jpeg", ".png"):
+            candidate = os.path.join(self._IMAGES_DIR, label + ext)
+            if os.path.isfile(candidate):
+                img_path = candidate
+                break
+        if img_path is None:
+            # Try generic fallback
+            for ext in (".png", ".jpg"):
+                candidate = os.path.join(self._IMAGES_DIR, "unknown" + ext)
+                if os.path.isfile(candidate):
+                    img_path = candidate
+                    break
+        if img_path is None:
+            self._image_cache[label] = None
+            return None
+        try:
+            pil_img = _PILImage.open(img_path).convert("RGBA")  # type: ignore[union-attr]
+            # Proportional resize to fit thumbnail cell
+            resample = getattr(_PILImage, "LANCZOS",
+                               getattr(_PILImage, "ANTIALIAS", 1))
+            pil_img.thumbnail(self._image_size, resample)
+            ctk_img = ctk.CTkImage(
+                light_image=pil_img,
+                dark_image=pil_img,
+                size=(pil_img.width, pil_img.height),
+            )
+            self._image_cache[label] = ctk_img
+            return ctk_img
+        except Exception:
+            self._image_cache[label] = None
+            return None
+
+    def _start_blink(self) -> None:
+        """Begin blinking the emergency label (non-blocking, uses after())."""
+        self._blink_active = True
+        self._blink_visible = True
+
+        def _tick() -> None:
+            if not self._blink_active:
+                return
+            self._blink_visible = not self._blink_visible
+            color = self._RED if self._blink_visible else "#770000"
+            self._emergency_label.configure(text_color=color)
+            self._blink_after_id = self.root.after(400, _tick)
+
+        _tick()
+
+    def _stop_blink(self) -> None:
+        self._blink_active = False
+        if self._blink_after_id is not None:
+            self.root.after_cancel(self._blink_after_id)
+            self._blink_after_id = None
+        self._emergency_label.configure(text_color=self._RED)
 
     def run(self) -> None:
         """Start the tkinter mainloop (blocks)."""
