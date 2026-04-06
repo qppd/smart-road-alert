@@ -1620,6 +1620,11 @@ class SmartRoadAlertHost:
         # gate the alert — either direction means a vehicle is occupying the
         # road and the local side needs to react.
         signal = self._get_alert_signal(priority, "incoming", speed, emergency)
+        # _get_alert_signal returns "GO" for LOW-priority or slow MEDIUM vehicles
+        # (thresholds designed for LOCAL detection).  For REMOTE telemetry any
+        # detected vehicle always warrants at minimum SLOW on the receiving side.
+        if signal == "GO":
+            signal = "SLOW"
         h_dir  = data.get("h_direction", "FRONT")
 
         self._send_display_command(label, signal, speed, priority, emergency)
