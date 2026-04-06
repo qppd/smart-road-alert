@@ -1753,7 +1753,9 @@ class SmartRoadAlertHost:
         # ── No-vehicle reset packet: speed==0 && direction=="none" ──────────
         # The remote RPi sends this every second when its YOLO has no
         # detections.  Update the cv2 HUD overlay only; the GUI smoothing
-        # timer (_last_received_time) handles the 3-second hold before clearing.
+        # timer (_last_received_time) handles the 3-second hold before clearing
+        # the signal (GO/SLOW/STOP).  We DO clear the vehicle info fields
+        # immediately so the image/label disappears as soon as RPi2 sees nothing.
         if speed == 0.0 and direction in ("none", "unknown") and not emergency:
             self._last_telemetry.update({
                 "label":     "none",
@@ -1764,6 +1766,14 @@ class SmartRoadAlertHost:
                 "emergency": False,
                 "last_seen": time.time(),
             })
+            # Clear vehicle info in the display snapshot so the image is removed
+            # immediately without waiting for the hold timer to expire.
+            with self._display_lock:
+                self._remote_display.update({
+                    "label":     "none",
+                    "speed":     0.0,
+                    "direction": "NONE",
+                })
             self._tts_remote_alert("none", 0.0, "GO", False)
             logger.debug("REMOTE → no vehicle | source=%s", node)
             return
